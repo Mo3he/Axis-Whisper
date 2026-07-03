@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whisper Subtitles - Settings</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 0; padding: 24px; line-height: 1.4;
+    background: #f5f6f7; color: #1a1a1a;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1c1d1f; color: #e8e8e8; }
+    .card { background: #26282b !important; border-color: #3a3d40 !important; }
+    input, select { background: #1c1d1f !important; color: #e8e8e8 !important; border-color: #45484c !important; }
+    .hint { color: #9aa0a6 !important; }
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #6b7280; margin: 0 0 20px; font-size: 13px; }
+  .card {
+    max-width: 640px; background: #fff; border: 1px solid #e2e4e7;
+    border-radius: 10px; padding: 20px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em;
+    color: #6b7280; margin: 0 0 14px; }
+  .row { display: grid; grid-template-columns: 220px 1fr; gap: 12px;
+    align-items: center; margin-bottom: 14px; }
+  .row:last-child { margin-bottom: 0; }
+  label { font-weight: 600; font-size: 14px; }
+  .hint { display: block; font-weight: 400; color: #6b7280; font-size: 12px; margin-top: 2px; }
+  input, select {
+    width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 14px;
+    border: 1px solid #cfd3d7; border-radius: 6px; background: #fff; color: #1a1a1a;
+  }
+  .actions { max-width: 640px; display: flex; align-items: center; gap: 14px; }
+  button {
+    background: #1668e3; color: #fff; border: 0; border-radius: 6px;
+    padding: 10px 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  button.secondary { background: #6b7280; }
+  #status { font-size: 14px; }
+  #status.ok { color: #12805c; }
+  #status.err { color: #c1121f; }
+  @media (max-width: 560px) { .row { grid-template-columns: 1fr; gap: 4px; } }
+</style>
+</head>
+<body>
+  <h1>Whisper Subtitles</h1>
+  <p class="sub">Tune speech detection and subtitle rendering for your environment. Changes apply live (except subtitle position, which needs an app restart).</p>
+
+  <form id="form">
+    <div class="card">
+      <h2>Speech detection</h2>
+      <div class="row">
+        <label>Microphone sensitivity
+          <span class="hint">Raise if you speak but get no subtitles; lower if noise is picked up as speech.</span>
+        </label>
+        <select id="MicSensitivity">
+          <option value="Low">Low</option>
+          <option value="Normal">Normal</option>
+          <option value="High">High</option>
+          <option value="Maximum">Maximum</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>Silence timeout (ms)
+          <span class="hint">Silence gap that ends a phrase (200-3000).</span>
+        </label>
+        <input type="number" id="SilenceTimeoutMs" min="200" max="3000" step="50">
+      </div>
+      <div class="row">
+        <label>Minimum speech (ms)
+          <span class="hint">Ignore bursts shorter than this (100-2000).</span>
+        </label>
+        <input type="number" id="MinSpeechMs" min="100" max="2000" step="50">
+      </div>
+      <div class="row">
+        <label>Maximum phrase (s)
+          <span class="hint">Longest utterance sent to whisper (2-15).</span>
+        </label>
+        <input type="number" id="MaxUtteranceSec" min="2" max="15" step="1">
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Subtitle display</h2>
+      <div class="row">
+        <label>Live streaming captions
+          <span class="hint">Build up the caption word-by-word as the person speaks (recommended for interviews) instead of showing each phrase only after a pause.</span>
+        </label>
+        <select id="StreamingCaptions">
+          <option value="yes">On</option>
+          <option value="no">Off</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>On-screen duration (s)
+          <span class="hint">How long a subtitle stays after the last speech (1-30).</span>
+        </label>
+        <input type="number" id="SubtitleDurationSec" min="1" max="30" step="1">
+      </div>
+      <div class="row">
+        <label>Font size</label>
+        <select id="FontScale">
+          <option value="Small">Small</option>
+          <option value="Medium">Medium</option>
+          <option value="Large">Large</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>Position
+          <span class="hint">Takes effect after an app restart.</span>
+        </label>
+        <select id="SubtitlePosition">
+          <option value="Bottom">Bottom</option>
+          <option value="Top">Top</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Remote audio (optional)</h2>
+      <div class="row">
+        <label>Source host
+          <span class="hint">Axis device to pull audio from (VAPIX). Empty = this camera's own mic.</span>
+        </label>
+        <input type="text" id="RemoteAudioHost" placeholder="e.g. 192.168.0.246" autocomplete="off">
+      </div>
+      <div class="row">
+        <label>Username</label>
+        <input type="text" id="RemoteAudioUser" autocomplete="off">
+      </div>
+      <div class="row">
+        <label>Password</label>
+        <input type="password" id="RemoteAudioPass" autocomplete="new-password">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" id="saveBtn">Save</button>
+      <button type="button" class="secondary" id="reloadBtn">Reload</button>
+      <span id="status"></span>
+    </div>
+  </form>
+
+<script>
+(function () {
+  "use strict";
+  var GROUP = "Whisper_Subtitles";
+  var FIELDS = [
+    "MicSensitivity", "SilenceTimeoutMs", "MinSpeechMs", "MaxUtteranceSec",
+    "SubtitleDurationSec", "FontScale", "SubtitlePosition", "StreamingCaptions",
+    "RemoteAudioHost", "RemoteAudioUser", "RemoteAudioPass"
+  ];
+
+  var statusEl = document.getElementById("status");
+  var saveBtn = document.getElementById("saveBtn");
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg;
+    statusEl.className = kind || "";
+  }
+
+  function param(action, query) {
+    var url = "/axis-cgi/param.cgi?action=" + action + (query ? "&" + query : "");
+    return fetch(url, { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.text();
+      });
+  }
+
+  function load() {
+    setStatus("Loading...");
+    return param("list", "group=" + GROUP).then(function (text) {
+      var map = {};
+      text.split(/\r?\n/).forEach(function (line) {
+        var i = line.indexOf("=");
+        if (i > 0) {
+          var name = line.slice(0, i).split(".").pop();
+          map[name] = line.slice(i + 1);
+        }
+      });
+      FIELDS.forEach(function (name) {
+        var el = document.getElementById(name);
+        if (el && map.hasOwnProperty(name)) el.value = map[name];
+      });
+      setStatus("");
+    }).catch(function (e) {
+      setStatus("Could not load settings: " + e.message, "err");
+    });
+  }
+
+  function save() {
+    var parts = [];
+    FIELDS.forEach(function (name) {
+      var el = document.getElementById(name);
+      if (el) parts.push(GROUP + "." + name + "=" + encodeURIComponent(el.value));
+    });
+    setStatus("Saving...");
+    saveBtn.disabled = true;
+    param("update", parts.join("&")).then(function (text) {
+      if (/OK/i.test(text)) {
+        setStatus("Saved. Changes applied.", "ok");
+      } else {
+        setStatus("Device response: " + text.trim(), "err");
+      }
+    }).catch(function (e) {
+      setStatus("Save failed: " + e.message, "err");
+    }).then(function () {
+      saveBtn.disabled = false;
+    });
+  }
+
+  document.getElementById("form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    save();
+  });
+  document.getElementById("reloadBtn").addEventListener("click", load);
+
+  load();
+})();
+</script>
+</body>
+</html>

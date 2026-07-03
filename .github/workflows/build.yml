@@ -1,0 +1,74 @@
+name: Build & Release Whisper Subtitles ACAP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "common/**"
+      - "aarch64/**"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout repo
+      - uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      # 2. Get version from manifest
+      - name: Get version
+        run: |
+          VERSION=$(jq -r '.acapPackageConf.setup.version' aarch64/app/manifest.json)
+          echo "RELEASE_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Version: $VERSION"
+
+      # 3. Build each architecture folder and collect .eap files
+      - name: Build all folders
+        run: |
+          mkdir -p build
+          rm -rf releases
+          mkdir -p releases
+
+          for folder in */ ; do
+            FOLDER_NAME="${folder%/}"
+            [[ "$FOLDER_NAME" == "common" ]] && continue
+            [[ ! -d "$folder/app" ]] && continue
+            echo "Processing folder $FOLDER_NAME"
+
+            TAG_NAME=$(echo "$FOLDER_NAME" | tr '[:upper:]' '[:lower:]' | tr '/ ' '_')
+            echo "Building $TAG_NAME"
+            docker build -f "$folder/Dockerfile" --tag "$TAG_NAME" .
+
+            EAP_OUTPUT="./build/${TAG_NAME}"
+            mkdir -p "$EAP_OUTPUT"
+            CID=$(docker create "$TAG_NAME")
+            docker cp "$CID":/opt/app "$EAP_OUTPUT"
+            docker rm "$CID" >/dev/null
+
+            find "$EAP_OUTPUT" -type f -name "*.eap" -exec mv {} releases/ \;
+          done
+
+          rm -rf build
+          ls -lh releases/
+
+      # 4. Create GitHub Release with the .eap files (manual runs only)
+      - name: Create GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ env.RELEASE_VERSION }}
+          name: "Whisper Subtitles ${{ env.RELEASE_VERSION }}"
+          files: releases/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5. Keep the .eap files as workflow artifacts on normal pushes
+      - name: Upload artifacts
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-subtitles-eap
+          path: releases/*

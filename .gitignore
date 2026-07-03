@@ -1,0 +1,12 @@
+**/.DS_Store
+**/build
+
+# Do not track release artifacts (local .eap build outputs stay untracked anywhere in the tree)
+releases/
+build/
+*.eap
+
+# Staged build inputs - fetched fresh by the Dockerfile at build time, not stored in git
+common/app/whisper/
+common/app/*.bin
+common/app/Whisper_Subtitles

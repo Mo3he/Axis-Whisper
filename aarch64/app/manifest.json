@@ -1,0 +1,93 @@
+{
+    "schemaVersion": "2.0.0",
+    "resources": {
+        "dbus": {
+            "requiredMethods": [
+                "com.axis.Graphics2.*",
+                "com.axis.Overlay2.*"
+            ]
+        },
+        "linux": {
+            "user": {
+                "conditionalGroups": ["pipewire"]
+            }
+        }
+    },
+    "acapPackageConf": {
+        "setup": {
+            "appName": "Whisper_Subtitles",
+            "friendlyName": "Whisper Subtitles",
+            "vendor": "Mo3he",
+            "vendorId": "5741c1fb91",
+            "vendorUrl": "https://github.com/Mo3he/Axis-Whisper",
+            "version": "0.1.11",
+            "architecture": "aarch64",
+            "runMode": "never",
+            "compatibleOsVersions": [
+                {
+                    "max": "13"
+                }
+            ]
+        },
+        "configuration": {
+            "settingPage": "settings.html",
+            "paramConfig": [
+                {
+                    "name": "MicSensitivity",
+                    "default": "Normal",
+                    "type": "enum:Low,Normal,High,Maximum"
+                },
+                {
+                    "name": "SilenceTimeoutMs",
+                    "default": "800",
+                    "type": "int"
+                },
+                {
+                    "name": "MinSpeechMs",
+                    "default": "300",
+                    "type": "int"
+                },
+                {
+                    "name": "MaxUtteranceSec",
+                    "default": "6",
+                    "type": "int"
+                },
+                {
+                    "name": "SubtitleDurationSec",
+                    "default": "6",
+                    "type": "int"
+                },
+                {
+                    "name": "FontScale",
+                    "default": "Medium",
+                    "type": "enum:Small,Medium,Large"
+                },
+                {
+                    "name": "SubtitlePosition",
+                    "default": "Bottom",
+                    "type": "enum:Bottom,Top"
+                },
+                {
+                    "name": "StreamingCaptions",
+                    "default": "yes",
+                    "type": "bool:no,yes"
+                },
+                {
+                    "name": "RemoteAudioHost",
+                    "default": "",
+                    "type": "string"
+                },
+                {
+                    "name": "RemoteAudioUser",
+                    "default": "",
+                    "type": "string"
+                },
+                {
+                    "name": "RemoteAudioPass",
+                    "default": "",
+                    "type": "string"
+                }
+            ]
+        }
+    }
+}
