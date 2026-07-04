@@ -82,6 +82,21 @@
 #define NOISE_FLOOR_MIN 0.0005f
 #define NOISE_FLOOR_MAX 0.02f
 
+/* An utterance whose peak amplitude never rises above this is treated as
+ * noise/near-silence and not transcribed. Kept low so genuinely quiet but
+ * real speech from a good microphone is still transcribed; the upstream VAD
+ * gate is the primary speech/noise decision. */
+#define SIGNAL_PEAK_MIN 0.02f
+
+/* Adaptive noise guard: an utterance is only transcribed if its peak clears
+ * the adaptive room noise floor by this margin (or SIGNAL_PEAK_MIN, whichever
+ * is higher). In a quiet room the floor is tiny, so quiet speech passes; in a
+ * noisy room (e.g. constant background chatter on a CCTV install) the floor
+ * rises, so only clear foreground speech is transcribed. This keeps whisper
+ * from running - and hallucinating - on background noise, which also prevents
+ * the transcriber falling behind and dropping audio. */
+#define SIGNAL_SNR_MARGIN 8.0f
+
 /* Default subtitle on-screen duration after the last transcription. */
 #define DEFAULT_SUBTITLE_TTL_SEC 6
 
@@ -92,6 +107,15 @@
  * each partial pass cheap. */
 #define STREAM_STEP_MS 900
 #define STREAM_STEP_SAMPLES (SAMPLE_RATE * STREAM_STEP_MS / 1000)
+
+/* Streaming partials re-transcribe the growing utterance and multiply CPU
+ * cost. Under continuous speech (a busy CCTV scene with people talking in the
+ * background) that makes the single transcription thread fall behind realtime
+ * and drop audio. So partials are only emitted while the reader is keeping up:
+ * if it has fallen more than this far behind the capture head, partials are
+ * skipped and only the final (one pass per utterance) is produced, letting the
+ * backlog drain. */
+#define STREAM_MAX_BACKLOG_SAMPLES (SAMPLE_RATE * 2) /* ~2 s */
 
 #define SUBTITLE_MAX 512
 #define MAX_LINES 2
@@ -824,17 +848,42 @@ static int read_frame(uint64_t *next, int16_t *frame) {
     return dropped;
 }
 
+/* True when the whole line is a single non-speech annotation that whisper
+ * emits on silence or music, e.g. "[BLANK_AUDIO]", "(bell dings)", or a line
+ * of musical notes. A line that merely contains a parenthetical or starts
+ * with an accented (non-ASCII) word is real speech and is kept. */
+static bool is_nonspeech_annotation(const char *text) {
+    if (text == NULL || text[0] == '\0')
+        return true;
+    /* Musical note glyphs U+2669..U+266C (UTF-8 E2 99 A9..AC) => music. */
+    if ((unsigned char)text[0] == 0xE2 && (unsigned char)text[1] == 0x99)
+        return true;
+    size_t len = strlen(text);
+    if (len >= 2) {
+        if (text[0] == '[' && text[len - 1] == ']')
+            return true;
+        if (text[0] == '(' && text[len - 1] == ')')
+            return true;
+        /* Asterisk-wrapped stage directions, e.g. "*crying*", "*cackling*". */
+        if (text[0] == '*' && text[len - 1] == '*')
+            return true;
+    }
+    return false;
+}
+
 /* Detect whisper's degenerate repetition loops (e.g. "Long day. Long day.
  * Long day. ..." x50), a common failure mode on quiet or non-speech audio.
  * Returns true when the phrase has many words but very few distinct ones,
- * so it can be filtered out instead of posted as a subtitle. */
+ * so it can be filtered out instead of posted as a subtitle. Thresholds are
+ * deliberately conservative so legitimately repetitive real speech (phone
+ * numbers, "no no no", counting) is not misfiltered. */
 static bool looks_repetitive(const char *text) {
     gchar **words = g_strsplit(text, " ", -1);
     int total = 0;
     for (int i = 0; words[i] != NULL; i++)
         if (words[i][0] != '\0')
             total++;
-    if (total < 10) {
+    if (total < 16) {
         g_strfreev(words);
         return false;
     }
@@ -854,8 +903,8 @@ static bool looks_repetitive(const char *text) {
             distinct++;
     }
     g_strfreev(words);
-    /* <= 25% unique words over a long phrase => hallucinated loop */
-    return distinct * 4 <= total;
+    /* <= 20% unique words over a long phrase => hallucinated loop */
+    return distinct * 5 <= total;
 }
 
 /* Run whisper on utt[0..n_samples) with per-utterance normalization, a
@@ -870,7 +919,8 @@ static bool transcribe_buffer(struct whisper_context *ctx,
                               float *pcmf,
                               char *out,
                               size_t out_sz,
-                              gint64 *out_ms) {
+                              gint64 *out_ms,
+                              float noise_floor) {
     out[0] = '\0';
     if (out_ms != NULL)
         *out_ms = 0;
@@ -891,8 +941,11 @@ static bool transcribe_buffer(struct whisper_context *ctx,
         if (a > peak)
             peak = a;
     }
-    if (peak < 0.10f)
-        return false; /* noise / near-silence: do not transcribe */
+    float skip_thresh = noise_floor * SIGNAL_SNR_MARGIN;
+    if (skip_thresh < SIGNAL_PEAK_MIN)
+        skip_thresh = SIGNAL_PEAK_MIN;
+    if (peak < skip_thresh)
+        return false; /* below the adaptive noise guard: do not transcribe */
     float norm = 0.85f / peak;
     if (norm > 4.0f)
         norm = 4.0f;
@@ -916,18 +969,19 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     wp.print_timestamps = false;
     wp.print_special = false;
     wp.suppress_blank = true;
-    /* Single greedy decode (no temperature fallback). Fallback re-decodes a
-     * degenerate segment up to ~6 times at rising temperatures, which on
-     * noisy/unintelligible audio costs many seconds per utterance and breaks
-     * live streaming. Repetition loops are instead caught cheaply afterwards
-     * by looks_repetitive(). */
+    /* Single greedy decode, no temperature fallback. Fallback re-decodes a
+     * degenerate segment up to ~6 times at rising temperatures; on the
+     * unintelligible background speech common to CCTV installs that costs
+     * many seconds (observed 8-68 s) per utterance, which makes the
+     * transcriber fall behind and drop audio. Repetition loops are caught
+     * cheaply afterwards by looks_repetitive() instead. */
     wp.temperature_inc = 0.0f;
     /* Cap decoded tokens per segment. On unintelligible audio whisper never
      * emits an end-of-text token and greedily decodes to its internal
      * maximum (~224 tokens), which makes a single pass take many seconds and
-     * causes the transcriber to fall behind and drop audio. A subtitle line
-     * never needs that many tokens, so bound it. */
-    wp.max_tokens = 48;
+     * causes the transcriber to fall behind and drop audio. 64 tokens still
+     * fits a full subtitle line while bounding runaway decode on noise. */
+    wp.max_tokens = 64;
     /* Encoder context sized to the audio (~50 mel-ctx units per second) plus
      * margin, capped at the full 1500. Short partial buffers encode far
      * faster than the fixed 30 s window, which is what makes ~1 s streaming
@@ -958,10 +1012,12 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     g_strstrip(text);
     g_strlcpy(out, text, out_sz);
 
-    /* Drop typical non-speech hallucinations: "[BLANK_AUDIO]",
-     * "(bell dings)", "♪", and repetition loops. */
-    if (text[0] == '\0' || text[0] == '[' || text[0] == '(' ||
-        (unsigned char)text[0] > 0x7f || looks_repetitive(text))
+    /* Drop typical non-speech hallucinations: whole-line annotations like
+     * "[BLANK_AUDIO]" or "(bell dings)", musical notes, and repetition
+     * loops. Lines that merely start with an accented word or contain a
+     * parenthetical are kept. */
+    if (text[0] == '\0' || is_nonspeech_annotation(text) ||
+        looks_repetitive(text))
         return false;
     return true;
 }
@@ -971,11 +1027,12 @@ static void transcribe_utterance(struct whisper_context *ctx,
                                  const int16_t *utt,
                                  int n_samples,
                                  float *pcmf,
-                                 float rms) {
+                                 float rms,
+                                 float noise_floor) {
     char text[SUBTITLE_MAX];
     gint64 ms = 0;
     bool ok = transcribe_buffer(ctx, utt, n_samples, pcmf, text, sizeof(text),
-                                &ms);
+                                &ms, noise_floor);
     if (ok) {
         syslog(LOG_INFO,
                "[%.1f s final, %" G_GINT64_FORMAT " ms, rms %.4f] %s",
@@ -989,8 +1046,11 @@ static void transcribe_utterance(struct whisper_context *ctx,
 
 static void *transcribe_thread(void *arg) {
     (void)arg;
-    /* Be a good neighbour to the encoder/analytics (Linux: per-thread) */
-    setpriority(PRIO_PROCESS, 0, 5);
+    /* Yield to the encoder/analytics under contention, but only slightly:
+     * a real microphone triggers inference intermittently, so a heavy nice
+     * handicap just slows each transcription for no benefit. (Was +5, chosen
+     * when constant mic noise triggered whisper nonstop.) */
+    setpriority(PRIO_PROCESS, 0, 1);
 
     whisper_log_set(whisper_log_cb, NULL);
 
@@ -1116,15 +1176,25 @@ static void *transcribe_thread(void *arg) {
             utt_len + FRAME_SAMPLES <= max_samples) {
             /* Utterance still in progress. In streaming mode, re-transcribe
              * the audio so far every STREAM_STEP_SAMPLES and update the
-             * on-screen caption so it builds up live as the person speaks.
-             * The inference blocks the reader briefly, but the 32 s ring
-             * buffer absorbs the gap and we catch up on the next reads. */
-            if (cfg.streaming && speech_frames >= cfg.min_speech_frames &&
+             * on-screen caption so it builds up live as the person speaks -
+             * but only while the transcriber is keeping up. If it has fallen
+             * behind (busy/continuous audio), skip the partial and let the
+             * reader drain the backlog; the final pass still captions the
+             * utterance. */
+            bool keeping_up = true;
+            if (cfg.streaming) {
+                pthread_mutex_lock(&g_ring_lock);
+                uint64_t backlog = g_written - next;
+                pthread_mutex_unlock(&g_ring_lock);
+                keeping_up = backlog < STREAM_MAX_BACKLOG_SAMPLES;
+            }
+            if (cfg.streaming && keeping_up &&
+                speech_frames >= cfg.min_speech_frames &&
                 utt_len - last_partial >= STREAM_STEP_SAMPLES) {
                 char part[SUBTITLE_MAX];
                 gint64 pms = 0;
                 if (transcribe_buffer(ctx, utt, utt_len, pcmf, part,
-                                      sizeof(part), &pms)) {
+                                      sizeof(part), &pms, noise_floor)) {
                     syslog(LOG_INFO,
                            "[%.1f s partial, %" G_GINT64_FORMAT " ms] %s",
                            (double)utt_len / SAMPLE_RATE, pms, part);
@@ -1137,7 +1207,7 @@ static void *transcribe_thread(void *arg) {
 
         if (speech_frames >= cfg.min_speech_frames) {
             float utt_rms = sqrtf((float)(utt_energy / utt_len));
-            transcribe_utterance(ctx, utt, utt_len, pcmf, utt_rms);
+            transcribe_utterance(ctx, utt, utt_len, pcmf, utt_rms, noise_floor);
         } else {
             syslog(LOG_INFO,
                    "utterance discarded: %.1f s, %d speech frames "

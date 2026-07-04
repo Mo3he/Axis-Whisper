@@ -142,9 +142,19 @@ so whisper always sees whole phrases.
   think "live captions", not lip-sync.
 - **Accuracy:** `base.en` is a small model listening to a far-field camera
   microphone. It performs well with clear speech within a few meters; noisy
-  scenes will produce mistakes. Obvious non-speech hallucinations
-  (`[BLANK_AUDIO]`, `(music)`, …) are filtered out.
-- **CPU:** inference uses 2–3 cores while speech is present. The app runs at
+  scenes will produce mistakes. An adaptive noise guard raises the speech
+  threshold as the room gets louder, so quiet rooms still pick up soft speech
+  while noisy rooms only transcribe clear foreground speech. Obvious non-speech
+  hallucinations (`[BLANK_AUDIO]`, `(music)`, `*sighs*`, ...) are filtered out.
+- **Multiple speakers / background chatter:** the app transcribes whatever
+  speech it hears and cannot tell a target talker from background
+  conversation. In a busy scene it will caption background voices too. For a
+  specific talker, use a close or directional microphone (for example a door
+  station or intercom) so that talker dominates the audio.
+- **Busy scenes stay live:** under continuous speech the transcriber skips the
+  live word-by-word partial updates and emits one caption per phrase instead,
+  so it keeps up with the audio rather than falling behind and dropping it.
+- **CPU:** inference uses 2-3 cores while speech is present. The app runs at
   lowered priority and gates on silence, but expect it to compete with heavy
   analytics apps.
 - **English only** with the bundled `base.en` model. Multilingual models work
