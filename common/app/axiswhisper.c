@@ -18,10 +18,12 @@
 #include <cairo/cairo.h>
 #include <glib-unix.h>
 #include <glib.h>
+#include <glib/gstdio.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -38,6 +40,10 @@
 #include <curl/curl.h>
 
 #include "whisper.h"
+
+#include "mqtt.h"
+#include "transcript.h"
+#include "webapi.h"
 
 #define APP_NAME "Whisper_Subtitles"
 #define PKG_DIR "/usr/local/packages/" APP_NAME
@@ -118,7 +124,13 @@
 #define STREAM_MAX_BACKLOG_SAMPLES (SAMPLE_RATE * 2) /* ~2 s */
 
 #define SUBTITLE_MAX 512
-#define MAX_LINES 2
+/* Maximum caption lines the renderer can lay out. The number actually shown
+ * is runtime-tunable (cfg.max_lines) up to this compile-time cap. */
+#define MAX_LINES 3
+
+/* Localhost port for the transcription HTTP API. Must match the reverseProxy
+ * target in manifest.json. */
+#define API_PORT 2721
 
 /* ------------------------------------------------------------------ */
 /* Shared state                                                        */
@@ -140,6 +152,10 @@ static pthread_mutex_t g_sub_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static gint g_overlay_id = -1;
 
+/* Optional path to a user-supplied model (downloaded from ModelUrl); when set
+ * it is loaded in preference to the bundled ggml-*.bin. */
+static gchar *g_model_path_override = NULL;
+
 /* ------------------------------------------------------------------ */
 /* Runtime configuration                                               */
 /*                                                                     */
@@ -159,6 +175,27 @@ struct config {
     gint64 subtitle_ttl_us;/* how long a subtitle stays on screen */
     double font_scale;     /* subtitle font size multiplier */
     bool streaming;        /* emit live partial captions during speech */
+
+    /* On-screen subtitles. When disabled, transcription still runs and is
+     * published to the HTTP API and MQTT, but nothing is burned into video. */
+    bool subtitles_enabled;
+    int max_lines;         /* caption lines shown (1..MAX_LINES) */
+    double bar_height_frac;/* subtitle bar height as fraction of frame */
+    double bg_opacity;     /* backing box alpha (0..1) */
+    double text_r, text_g, text_b; /* subtitle text colour (0..1) */
+
+    /* Whisper decode parameters. */
+    int n_threads;         /* inference threads */
+    int max_tokens;        /* max decoded tokens per segment */
+    bool translate;        /* translate to English (multilingual models) */
+    bool temp_fallback;    /* enable temperature fallback re-decode */
+    char language[16];     /* whisper language code, e.g. "en" or "auto" */
+
+    /* Advanced speech/noise tuning. */
+    float snr_margin;      /* transcribe only if peak clears floor * this */
+    float peak_min;        /* absolute peak floor below which audio is noise */
+    float max_gain;        /* cap on per-utterance normalization gain */
+    int stream_step_samples; /* streaming partial re-transcribe cadence */
 };
 
 static struct config g_cfg = {
@@ -170,6 +207,22 @@ static struct config g_cfg = {
     .subtitle_ttl_us = (gint64)DEFAULT_SUBTITLE_TTL_SEC * G_USEC_PER_SEC,
     .font_scale = 1.0,
     .streaming = true,
+    .subtitles_enabled = true,
+    .max_lines = 2,
+    .bar_height_frac = 0.2,
+    .bg_opacity = 0.55,
+    .text_r = 1.0,
+    .text_g = 1.0,
+    .text_b = 1.0,
+    .n_threads = N_THREADS,
+    .max_tokens = 64,
+    .translate = false,
+    .temp_fallback = false,
+    .language = "en",
+    .snr_margin = SIGNAL_SNR_MARGIN,
+    .peak_min = SIGNAL_PEAK_MIN,
+    .max_gain = 4.0f,
+    .stream_step_samples = STREAM_STEP_SAMPLES,
 };
 static pthread_mutex_t g_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -186,6 +239,19 @@ static void cfg_snapshot(struct config *out) {
 static int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+
+static double clampd(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static bool parse_bool(const char *value) {
+    return g_ascii_strcasecmp(value, "yes") == 0 ||
+           g_ascii_strcasecmp(value, "true") == 0 ||
+           g_ascii_strcasecmp(value, "on") == 0 || g_strcmp0(value, "1") == 0;
+}
+
+/* Redraw request; defined with the overlay code further down. */
+static void request_redraw(void);
 
 /* Map the Settings web page values onto the config struct. Called both at
  * startup (for every parameter) and from the change callback. Unknown
@@ -251,6 +317,89 @@ static void cfg_apply(const char *name, const char *value) {
         pthread_mutex_lock(&g_cfg_lock);
         g_cfg.streaming = on;
         pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "SubtitlesEnabled")) {
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.subtitles_enabled = parse_bool(value);
+        pthread_mutex_unlock(&g_cfg_lock);
+        request_redraw(); /* clear or restore the overlay immediately */
+    } else if (g_str_has_suffix(name, "MaxLines")) {
+        int n = clampi(atoi(value), 1, MAX_LINES);
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.max_lines = n;
+        pthread_mutex_unlock(&g_cfg_lock);
+        request_redraw();
+    } else if (g_str_has_suffix(name, "BarHeightPct")) {
+        double f = clampi(atoi(value), 5, 50) / 100.0;
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.bar_height_frac = f;
+        pthread_mutex_unlock(&g_cfg_lock);
+        request_redraw();
+    } else if (g_str_has_suffix(name, "BackgroundOpacity")) {
+        double o = clampi(atoi(value), 0, 100) / 100.0;
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.bg_opacity = o;
+        pthread_mutex_unlock(&g_cfg_lock);
+        request_redraw();
+    } else if (g_str_has_suffix(name, "TextColor")) {
+        const char *h = value;
+        if (h[0] == '#')
+            h++;
+        if (strlen(h) >= 6) {
+            char c[3] = {0, 0, 0};
+            c[0] = h[0]; c[1] = h[1];
+            double r = (double)g_ascii_strtoll(c, NULL, 16) / 255.0;
+            c[0] = h[2]; c[1] = h[3];
+            double g = (double)g_ascii_strtoll(c, NULL, 16) / 255.0;
+            c[0] = h[4]; c[1] = h[5];
+            double b = (double)g_ascii_strtoll(c, NULL, 16) / 255.0;
+            pthread_mutex_lock(&g_cfg_lock);
+            g_cfg.text_r = r; g_cfg.text_g = g; g_cfg.text_b = b;
+            pthread_mutex_unlock(&g_cfg_lock);
+            request_redraw();
+        }
+    } else if (g_str_has_suffix(name, "InferenceThreads")) {
+        int n = clampi(atoi(value), 1, 4);
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.n_threads = n;
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "MaxTokens")) {
+        int n = clampi(atoi(value), 16, 224);
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.max_tokens = n;
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "TemperatureFallback")) {
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.temp_fallback = parse_bool(value);
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "Translate")) {
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.translate = parse_bool(value);
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "Language")) {
+        pthread_mutex_lock(&g_cfg_lock);
+        g_strlcpy(g_cfg.language, value[0] != '\0' ? value : "en",
+                  sizeof(g_cfg.language));
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "NoiseGuardMargin")) {
+        double v = clampd(g_ascii_strtod(value, NULL), 0.5, 40.0);
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.snr_margin = (float)v;
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "MinSignalPeak")) {
+        double v = clampd(g_ascii_strtod(value, NULL), 0.0, 0.5);
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.peak_min = (float)v;
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "MaxGain")) {
+        double v = clampd(g_ascii_strtod(value, NULL), 1.0, 10.0);
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.max_gain = (float)v;
+        pthread_mutex_unlock(&g_cfg_lock);
+    } else if (g_str_has_suffix(name, "StreamStepMs")) {
+        int ms = clampi(atoi(value), 300, 3000);
+        pthread_mutex_lock(&g_cfg_lock);
+        g_cfg.stream_step_samples = SAMPLE_RATE * ms / 1000;
+        pthread_mutex_unlock(&g_cfg_lock);
     }
 }
 
@@ -309,10 +458,16 @@ static void request_redraw(void) {
 static int wrap_text(cairo_t *cr,
                      const char *text,
                      double max_width,
+                     int max_lines,
                      char lines[MAX_LINES][SUBTITLE_MAX]) {
     char tmp[8][SUBTITLE_MAX];
     int count = 0;
     char cur[SUBTITLE_MAX] = "";
+
+    if (max_lines < 1)
+        max_lines = 1;
+    if (max_lines > MAX_LINES)
+        max_lines = MAX_LINES;
 
     gchar **words = g_strsplit(text, " ", -1);
     for (gchar **w = words; *w != NULL; w++) {
@@ -338,7 +493,7 @@ static int wrap_text(cairo_t *cr,
         g_strlcpy(tmp[count++], cur, SUBTITLE_MAX);
     g_strfreev(words);
 
-    int start = count > MAX_LINES ? count - MAX_LINES : 0;
+    int start = count > max_lines ? count - max_lines : 0;
     for (int i = start; i < count; i++)
         g_strlcpy(lines[i - start], tmp[i], SUBTITLE_MAX);
     return count - start;
@@ -376,6 +531,8 @@ static void render_overlay_cb(gpointer render_context,
 
     struct config cfg;
     cfg_snapshot(&cfg);
+    if (!cfg.subtitles_enabled)
+        return; /* transcription still runs; nothing is burned into video */
 
     double font_size = overlay_height / 3.2 * cfg.font_scale;
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL,
@@ -383,7 +540,7 @@ static void render_overlay_cb(gpointer render_context,
     cairo_set_font_size(cr, font_size);
 
     char lines[MAX_LINES][SUBTITLE_MAX];
-    int n_lines = wrap_text(cr, text, overlay_width * 0.92, lines);
+    int n_lines = wrap_text(cr, text, overlay_width * 0.92, cfg.max_lines, lines);
     if (n_lines == 0)
         return;
 
@@ -398,13 +555,13 @@ static void render_overlay_cb(gpointer render_context,
         double baseline = block_top + line_h * i + font_size;
 
         /* Semi-transparent backing box */
-        cairo_set_source_rgba(cr, 0, 0, 0, 0.55);
+        cairo_set_source_rgba(cr, 0, 0, 0, cfg.bg_opacity);
         cairo_rectangle(cr, tx - pad, baseline - font_size, ext.width + 2 * pad,
                         line_h);
         cairo_fill(cr);
 
         /* Subtitle text */
-        cairo_set_source_rgba(cr, 1, 1, 1, 1);
+        cairo_set_source_rgba(cr, cfg.text_r, cfg.text_g, cfg.text_b, 1);
         cairo_move_to(cr, tx, baseline);
         cairo_show_text(cr, lines[i]);
     }
@@ -423,9 +580,11 @@ static void adjustment_cb(gint id,
     (void)overlay_x;
     (void)overlay_y;
     (void)user_data;
-    /* Subtitle bar: full stream width, bottom fifth of the frame */
+    /* Subtitle bar: full stream width, a configurable fraction of the frame */
+    struct config cfg;
+    cfg_snapshot(&cfg);
     *overlay_width = stream->width;
-    *overlay_height = stream->height / 5;
+    *overlay_height = (gint)(stream->height * cfg.bar_height_frac);
 }
 
 /* Clear stale subtitles */
@@ -787,7 +946,6 @@ static void *remote_audio_thread(void *arg) {
 }
 
 static bool start_remote_audio(const char *host, const char *user, const char *pass) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
     ulaw_table_init();
 
     struct remote_ctx *ctx = g_malloc0(sizeof(*ctx));
@@ -925,6 +1083,9 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     if (out_ms != NULL)
         *out_ms = 0;
 
+    struct config cfg;
+    cfg_snapshot(&cfg);
+
     /* whisper needs at least ~1 s of audio; pad with silence */
     int n = n_samples;
     for (int i = 0; i < n; i++)
@@ -941,14 +1102,14 @@ static bool transcribe_buffer(struct whisper_context *ctx,
         if (a > peak)
             peak = a;
     }
-    float skip_thresh = noise_floor * SIGNAL_SNR_MARGIN;
-    if (skip_thresh < SIGNAL_PEAK_MIN)
-        skip_thresh = SIGNAL_PEAK_MIN;
+    float skip_thresh = noise_floor * cfg.snr_margin;
+    if (skip_thresh < cfg.peak_min)
+        skip_thresh = cfg.peak_min;
     if (peak < skip_thresh)
         return false; /* below the adaptive noise guard: do not transcribe */
     float norm = 0.85f / peak;
-    if (norm > 4.0f)
-        norm = 4.0f;
+    if (norm > cfg.max_gain)
+        norm = cfg.max_gain;
     if (norm > 1.0f)
         for (int i = 0; i < n_samples; i++)
             pcmf[i] *= norm;
@@ -958,9 +1119,9 @@ static bool transcribe_buffer(struct whisper_context *ctx,
 
     struct whisper_full_params wp =
         whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    wp.n_threads = N_THREADS;
-    wp.language = "en";
-    wp.translate = false;
+    wp.n_threads = cfg.n_threads;
+    wp.language = cfg.language;
+    wp.translate = cfg.translate;
     wp.no_context = true;
     wp.single_segment = true;
     wp.no_timestamps = true;
@@ -969,19 +1130,19 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     wp.print_timestamps = false;
     wp.print_special = false;
     wp.suppress_blank = true;
-    /* Single greedy decode, no temperature fallback. Fallback re-decodes a
-     * degenerate segment up to ~6 times at rising temperatures; on the
-     * unintelligible background speech common to CCTV installs that costs
-     * many seconds (observed 8-68 s) per utterance, which makes the
+    /* Single greedy decode by default, no temperature fallback. Fallback
+     * re-decodes a degenerate segment up to ~6 times at rising temperatures;
+     * on the unintelligible background speech common to CCTV installs that
+     * costs many seconds (observed 8-68 s) per utterance, which makes the
      * transcriber fall behind and drop audio. Repetition loops are caught
-     * cheaply afterwards by looks_repetitive() instead. */
-    wp.temperature_inc = 0.0f;
+     * cheaply afterwards by looks_repetitive() instead. Users can opt into
+     * fallback (better accuracy on hard speech) via the settings. */
+    wp.temperature_inc = cfg.temp_fallback ? 0.2f : 0.0f;
     /* Cap decoded tokens per segment. On unintelligible audio whisper never
      * emits an end-of-text token and greedily decodes to its internal
      * maximum (~224 tokens), which makes a single pass take many seconds and
-     * causes the transcriber to fall behind and drop audio. 64 tokens still
-     * fits a full subtitle line while bounding runaway decode on noise. */
-    wp.max_tokens = 64;
+     * causes the transcriber to fall behind and drop audio. */
+    wp.max_tokens = cfg.max_tokens;
     /* Encoder context sized to the audio (~50 mel-ctx units per second) plus
      * margin, capped at the full 1500. Short partial buffers encode far
      * faster than the fixed 30 s window, which is what makes ~1 s streaming
@@ -1038,6 +1199,7 @@ static void transcribe_utterance(struct whisper_context *ctx,
                "[%.1f s final, %" G_GINT64_FORMAT " ms, rms %.4f] %s",
                (double)n_samples / SAMPLE_RATE, ms, rms, text);
         post_subtitle(text);
+        transcript_publish(text, TRUE);
     } else {
         syslog(LOG_INFO, "[%.1f s final, rms %.4f] filtered/skipped: \"%s\"",
                (double)n_samples / SAMPLE_RATE, rms, text);
@@ -1058,7 +1220,9 @@ static void *transcribe_thread(void *arg) {
      * MODEL arg), so the model can be swapped without changing code. */
     gchar *model_path = NULL;
     GError *derr = NULL;
-    GDir *dir = g_dir_open(PKG_DIR, 0, &derr);
+    if (g_model_path_override != NULL)
+        model_path = g_strdup(g_model_path_override);
+    GDir *dir = model_path == NULL ? g_dir_open(PKG_DIR, 0, &derr) : NULL;
     if (dir != NULL) {
         const gchar *name;
         while ((name = g_dir_read_name(dir)) != NULL) {
@@ -1068,7 +1232,7 @@ static void *transcribe_thread(void *arg) {
             }
         }
         g_dir_close(dir);
-    } else {
+    } else if (derr != NULL) {
         g_clear_error(&derr);
     }
     if (model_path == NULL)
@@ -1190,7 +1354,7 @@ static void *transcribe_thread(void *arg) {
             }
             if (cfg.streaming && keeping_up &&
                 speech_frames >= cfg.min_speech_frames &&
-                utt_len - last_partial >= STREAM_STEP_SAMPLES) {
+                utt_len - last_partial >= cfg.stream_step_samples) {
                 char part[SUBTITLE_MAX];
                 gint64 pms = 0;
                 if (transcribe_buffer(ctx, utt, utt_len, pcmf, part,
@@ -1199,6 +1363,7 @@ static void *transcribe_thread(void *arg) {
                            "[%.1f s partial, %" G_GINT64_FORMAT " ms] %s",
                            (double)utt_len / SAMPLE_RATE, pms, part);
                     post_subtitle(part);
+                    transcript_publish(part, FALSE);
                 }
                 last_partial = utt_len;
             }
@@ -1282,7 +1447,9 @@ static bool setup_overlay(void) {
         data.height = 1080;
         g_clear_error(&error);
     }
-    data.height /= 5;
+    struct config cfg0;
+    cfg_snapshot(&cfg0);
+    data.height = (gint)(data.height * cfg0.bar_height_frac);
 
     g_overlay_id = axoverlay_create_overlay(&data, NULL, &error);
     if (error != NULL) {
@@ -1293,6 +1460,89 @@ static bool setup_overlay(void) {
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* User-supplied model                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Read an application parameter; returns a newly allocated string (possibly
+ * NULL). Caller frees. */
+static gchar *param_get(AXParameter *params, const char *name) {
+    if (params == NULL)
+        return NULL;
+    gchar *value = NULL;
+    if (!ax_parameter_get(params, name, &value, NULL))
+        return NULL;
+    return value;
+}
+
+/* Download the GGML model at url into the app's writable localdata directory
+ * (cached by URL so it is fetched only once) and return its path, or any
+ * previously downloaded model on failure. Returns NULL when url is empty or
+ * nothing is available. Caller frees. */
+static gchar *download_user_model(const char *url) {
+    if (url == NULL || url[0] == '\0')
+        return NULL;
+
+    const char *model_path = PKG_DIR "/localdata/user-model.bin";
+    const char *url_path = PKG_DIR "/localdata/user-model.url";
+    const char *tmp_path = PKG_DIR "/localdata/user-model.tmp";
+
+    gchar *cached_url = NULL;
+    if (g_file_get_contents(url_path, &cached_url, NULL, NULL) &&
+        cached_url != NULL) {
+        g_strstrip(cached_url);
+        if (g_strcmp0(cached_url, url) == 0 &&
+            g_file_test(model_path, G_FILE_TEST_EXISTS)) {
+            g_free(cached_url);
+            syslog(LOG_INFO, "using cached user model (%s)", url);
+            return g_strdup(model_path);
+        }
+    }
+    g_free(cached_url);
+
+    syslog(LOG_INFO, "downloading model from %s", url);
+    FILE *fp = fopen(tmp_path, "wb");
+    if (fp == NULL) {
+        syslog(LOG_ERR, "cannot open %s for writing", tmp_path);
+        return g_file_test(model_path, G_FILE_TEST_EXISTS)
+                   ? g_strdup(model_path)
+                   : NULL;
+    }
+
+    CURL *curl = curl_easy_init();
+    CURLcode res = CURLE_FAILED_INIT;
+    if (curl != NULL) {
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+        res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    fclose(fp);
+
+    if (res != CURLE_OK) {
+        syslog(LOG_WARNING, "model download failed: %s",
+               curl_easy_strerror(res));
+        g_unlink(tmp_path);
+        return g_file_test(model_path, G_FILE_TEST_EXISTS)
+                   ? g_strdup(model_path)
+                   : NULL;
+    }
+    if (g_rename(tmp_path, model_path) != 0) {
+        syslog(LOG_WARNING, "could not store downloaded model");
+        g_unlink(tmp_path);
+        return NULL;
+    }
+    g_file_set_contents(url_path, url, -1, NULL);
+    syslog(LOG_INFO, "user model ready");
+    return g_strdup(model_path);
+}
+
 int main(void) {
     openlog(APP_NAME, LOG_PID, LOG_USER);
     syslog(LOG_INFO, "starting %s", APP_NAME);
@@ -1301,6 +1551,8 @@ int main(void) {
     setenv("XDG_CACHE_HOME", PKG_DIR "/localdata", 0);
 
     g_loop = g_main_loop_new(NULL, FALSE);
+    transcript_init();
+    curl_global_init(CURL_GLOBAL_DEFAULT);
 
     /* Read settings (from the Settings web page / VAPIX) before creating the
      * overlay, and keep the AXParameter handle alive so later changes are
@@ -1309,13 +1561,22 @@ int main(void) {
      * RemoteAudioHost set -> pull audio from another Axis device;
      * empty -> capture from this camera via PipeWire. */
     static const char *const tuning_params[] = {
-        "MicSensitivity",      "SilenceTimeoutMs", "MinSpeechMs",
+        "MicSensitivity",      "SilenceTimeoutMs",    "MinSpeechMs",
         "MaxUtteranceSec",     "SubtitleDurationSec", "FontScale",
-        "SubtitlePosition",    "StreamingCaptions",
+        "SubtitlePosition",    "StreamingCaptions",   "SubtitlesEnabled",
+        "MaxLines",            "BarHeightPct",        "BackgroundOpacity",
+        "TextColor",           "InferenceThreads",    "Language",
+        "Translate",           "MaxTokens",           "TemperatureFallback",
+        "NoiseGuardMargin",    "MinSignalPeak",       "MaxGain",
+        "StreamStepMs",
     };
     gchar *remote_host = NULL;
     gchar *remote_user = NULL;
     gchar *remote_pass = NULL;
+    gchar *model_url = NULL;
+    gboolean api_enabled = TRUE;
+    struct mqtt_config mcfg;
+    memset(&mcfg, 0, sizeof(mcfg));
     GError *perr = NULL;
     AXParameter *params = ax_parameter_new(APP_NAME, &perr);
     if (params != NULL) {
@@ -1324,6 +1585,53 @@ int main(void) {
         ax_parameter_get(params, "RemoteAudioHost", &remote_host, NULL);
         ax_parameter_get(params, "RemoteAudioUser", &remote_user, NULL);
         ax_parameter_get(params, "RemoteAudioPass", &remote_pass, NULL);
+        model_url = param_get(params, "ModelUrl");
+
+        gchar *v;
+        if ((v = param_get(params, "ApiEnabled")) != NULL) {
+            api_enabled = parse_bool(v);
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttEnabled")) != NULL) {
+            mcfg.enabled = parse_bool(v);
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttHost")) != NULL) {
+            g_strlcpy(mcfg.host, v, sizeof(mcfg.host));
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttPort")) != NULL) {
+            mcfg.port = atoi(v);
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttTls")) != NULL) {
+            mcfg.tls = parse_bool(v);
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttTlsVerify")) != NULL) {
+            mcfg.tls_verify = parse_bool(v);
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttUser")) != NULL) {
+            g_strlcpy(mcfg.user, v, sizeof(mcfg.user));
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttPass")) != NULL) {
+            g_strlcpy(mcfg.pass, v, sizeof(mcfg.pass));
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttTopic")) != NULL) {
+            g_strlcpy(mcfg.topic, v, sizeof(mcfg.topic));
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttClientId")) != NULL) {
+            g_strlcpy(mcfg.client_id, v, sizeof(mcfg.client_id));
+            g_free(v);
+        }
+        if ((v = param_get(params, "MqttPublishPartials")) != NULL) {
+            mcfg.publish_partials = parse_bool(v);
+            g_free(v);
+        }
     } else {
         syslog(LOG_WARNING, "axparameter unavailable: %s",
                perr != NULL ? perr->message : "unknown");
@@ -1363,6 +1671,15 @@ int main(void) {
     g_unix_signal_add(SIGINT, signal_handler_cb, NULL);
     g_timeout_add(500, expire_cb, NULL);
 
+    /* Resolve a user-supplied model (downloaded from ModelUrl) before the
+     * transcription thread loads it. */
+    g_model_path_override = download_user_model(model_url);
+    g_free(model_url);
+
+    /* Expose transcriptions to other systems. */
+    webapi_start(API_PORT, api_enabled);
+    mqtt_start(&mcfg);
+
     pthread_t transcribe_tid;
     pthread_create(&transcribe_tid, NULL, transcribe_thread, NULL);
 
@@ -1370,12 +1687,13 @@ int main(void) {
 
     g_running = false;
     pthread_cond_broadcast(&g_ring_cond);
+    webapi_stop();
+    mqtt_stop();
     stop_audio();
-    if (g_remote_started) {
+    if (g_remote_started)
         pthread_join(g_remote_tid, NULL);
-        curl_global_cleanup();
-    }
     pthread_join(transcribe_tid, NULL);
+    curl_global_cleanup();
 
     GError *error = NULL;
     if (g_overlay_id >= 0)
@@ -1384,6 +1702,7 @@ int main(void) {
     axoverlay_cleanup();
     if (params != NULL)
         ax_parameter_free(params);
+    g_free(g_model_path_override);
     g_main_loop_unref(g_loop);
 
     syslog(LOG_INFO, "stopped");

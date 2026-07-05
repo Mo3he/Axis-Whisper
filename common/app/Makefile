@@ -1,5 +1,5 @@
 PROG = Whisper_Subtitles
-SRCS = axiswhisper.c
+SRCS = axiswhisper.c transcript.c webapi.c mqtt.c
 PKGS = glib-2.0 gio-2.0 axoverlay cairo libpipewire-0.3 axparameter libcurl
 
 CFLAGS += $(shell pkg-config --cflags $(PKGS))
