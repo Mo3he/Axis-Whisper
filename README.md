@@ -1,7 +1,6 @@
 # Axis Whisper Subtitles
 
-Live speech-to-text subtitles, burned directly into your Axis camera's video
-streams — running **entirely on the camera**. No cloud services, no external
+Live speech-to-text — running **entirely on the camera**. No cloud services, no external
 server, no network dependencies.
 
 ```
