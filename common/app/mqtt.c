@@ -198,7 +198,10 @@ static void on_transcript(const char *text,
     g_string_append_printf(p, "\",\"timestampMs\":%" G_GINT64_FORMAT
                               ",\"final\":%s}",
                            ts_ms, is_final ? "true" : "false");
-    g_async_queue_push(g_queue, g_string_free(p, FALSE));
+    /* Parenthesize to bypass the GLib 2.76+ macro that would emit a
+     * reference to g_string_free_and_steal, which is absent on older
+     * firmware GLib. Call the real function so we stay backward compatible. */
+    g_async_queue_push(g_queue, (g_string_free)(p, FALSE));
 }
 
 void mqtt_start(const struct mqtt_config *cfg) {
