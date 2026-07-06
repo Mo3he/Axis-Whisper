@@ -118,10 +118,11 @@ curl --digest -u admin:pass "http://<camera>/axis-cgi/param.cgi?action=update\
 ```
 
 Restart the app after changing parameters. The app configures the remote
-device for G.711 streaming automatically (enables audio, sets the encoding)
-and reconnects with backoff if the stream drops. Remote audio is 8 kHz
-telephone bandwidth, so expect slightly lower accuracy than a local 16 kHz
-microphone.
+device for G.711 streaming automatically and reconnects with backoff if the
+stream drops. This is the only change the app makes to the remote device: a
+single best-effort `param.cgi?action=update` that sets `Audio.A0.Enabled=yes`
+and `AudioSource.A0.AudioEncoding=g711`. Remote audio is 8 kHz telephone
+bandwidth, so expect slightly lower accuracy than a local 16 kHz microphone.
 
 ## Transcription API
 
