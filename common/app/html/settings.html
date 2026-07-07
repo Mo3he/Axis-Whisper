@@ -158,10 +158,10 @@
     <div class="card">
       <h2>Remote audio (optional)</h2>
       <div class="row">
-        <label>Local audio input
-          <span class="hint">Which built-in mic to use, for devices with more than one. Leave empty to auto-select. Enter part of the input name shown in the App log (lines like “audio source available: … name ‘…’”). Restart to apply.</span>
+        <label>Microphone input
+          <span class="hint"><b>Leave empty for automatic (recommended)</b> — the app picks the device's processed microphone. Only set this if the device has several inputs and you want a specific one. Enter <b>part of the input name</b> (case-insensitive); open the <b>App log</b> and look for lines like <code>audio source available: … name 'AudioDevice0Input0'</code>, then enter e.g. <code>Input1</code> or <code>Unprocessed</code>. Applies on <b>Save &amp; restart app</b>. If nothing matches, no audio is captured — clear the field to return to automatic.</span>
         </label>
-        <input type="text" id="AudioInput" placeholder="auto" autocomplete="off">
+        <input type="text" id="AudioInput" placeholder="automatic" autocomplete="off">
       </div>
       <div class="row">
         <label>Source host

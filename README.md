@@ -114,6 +114,34 @@ curl --anyauth -u admin:pass "http://<camera>/axis-cgi/param.cgi?action=update\
 | `MaxGain`          | 4.0     | Cap on how much quiet speech is amplified (1–10).              |
 | `StreamStepMs`     | 900     | How often live captions refresh while speaking (300–3000 ms). Lower = more responsive, more CPU. |
 
+### Microphone input
+
+By default the app picks the microphone automatically. Axis devices expose the
+mic as several PipeWire sources — a fully processed node (`AudioDevice0Input0`,
+with the device's gain/AGC), one or more raw variants (`AudioDevice0Input0.Unprocessed`,
+`AudioDevice0Input0.Uncompressed`), and a silent `dummy-source` fallback. The
+app prefers the processed node, which is what you want in almost all cases, so
+**leave `Local audio input` empty**.
+
+You only need this setting on a device with more than one microphone, or to
+force a specific raw feed. Enter **part of the source name** (case-insensitive);
+it matches the source whose name or description contains your text, and still
+prefers the processed node when several match:
+
+| You type                          | Selects                                   |
+|-----------------------------------|-------------------------------------------|
+| *(empty)*                         | Automatic — the processed mic (recommended). |
+| `Input1`                          | The second input on a multi-input device. |
+| `AudioDevice1`                    | A second audio device (e.g. a USB mic).   |
+| `AudioDevice0Input0.Unprocessed`  | Exactly the unprocessed raw feed.         |
+| `AudioDevice0Input0.Uncompressed` | Exactly the uncompressed raw feed.        |
+
+Find the exact names your device exposes in **Apps > Whisper Subtitles > App
+log**, in lines like `audio source available: id 162 name 'AudioDevice0Input0'`.
+`AudioInput` is read at startup, so use **Save & restart app** to apply it. If
+your text matches no source the log shows `selected audio input not found` and
+no audio is captured — clear the field to return to automatic.
+
 ## Remote audio
 
 If the camera running the app has no microphone, it can pull audio from any
