@@ -27,6 +27,12 @@ server, no network dependencies.
   - on **another Axis device** on the network (camera, speaker, sensor —
     anything with a mic and VAPIX audio), see *Remote audio* below.
 
+The app also runs on devices **without a video pipeline or a local microphone**
+(for example recorders such as the AXIS S3008): it transcribes remote audio and
+publishes to the HTTP API and MQTT. On-screen subtitles are only shown where the
+device has a video overlay; on other devices the app starts, stays running and
+serves its Settings page so you can point it at a remote audio source.
+
 ## Installation
 
 1. Download the `.eap` file from the [releases page](../../releases), or build
@@ -46,6 +52,10 @@ Open **Apps > Whisper Subtitles > Settings** in the camera web UI to tune the
 app for your environment. Most changes apply live (no restart needed). The
 exceptions, which take effect when the app is restarted, are *Subtitle
 position*, *Custom model URL*, and the *HTTP API* and *MQTT* settings.
+
+Settings are stored by the app itself (in its own data directory), so the
+Settings page works on every device — including recorders that do not serve the
+VAPIX `param.cgi` parameter system.
 
 | Setting               | Default  | Meaning                                                                 |
 |-----------------------|----------|-------------------------------------------------------------------------|

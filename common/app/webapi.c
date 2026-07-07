@@ -3,6 +3,7 @@
  */
 
 #include "webapi.h"
+#include "settings.h"
 #include "transcript.h"
 
 #include <gio/gio.h>
@@ -18,6 +19,23 @@ struct sse_client {
 static GSocketService *g_service = NULL;
 static GList *g_clients = NULL; /* struct sse_client* */
 static guint g_heartbeat_id = 0;
+
+/* Config (settings) server context. Requests arriving on this local port are
+ * exposed through an admin-access reverseProxy route. */
+static guint16 g_config_port = 0;
+static const char *const *g_setting_names = NULL;
+static guint g_n_settings = 0;
+static const char *const *g_secret_names = NULL;
+static guint g_n_secret = 0;
+static webapi_apply_cb g_apply_cb = NULL;
+static void *g_apply_user = NULL;
+
+static gboolean is_secret_name(const char *name) {
+    for (guint i = 0; i < g_n_secret; i++)
+        if (g_strcmp0(name, g_secret_names[i]) == 0)
+            return TRUE;
+    return FALSE;
+}
 
 /* Per-request parsing context. */
 struct req_ctx {
@@ -116,6 +134,86 @@ static void req_ctx_free(struct req_ctx *ctx, gboolean close_conn) {
     g_free(ctx);
 }
 
+/* Local TCP port a connection arrived on, so we can tell the viewer API port
+ * from the admin config port. */
+static guint16 conn_local_port(GSocketConnection *conn) {
+    GSocketAddress *la = g_socket_connection_get_local_address(conn, NULL);
+    guint16 port = 0;
+    if (la != NULL) {
+        if (G_IS_INET_SOCKET_ADDRESS(la))
+            port = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(la));
+        g_object_unref(la);
+    }
+    return port;
+}
+
+/* Handle the admin settings endpoint. query is the raw query string (may be
+ * NULL). action=list returns all settings as JSON; action=update stores the
+ * given Name=value pairs, applies live ones and persists them. */
+static void handle_config(GSocketConnection *conn, const char *query) {
+    gchar *action = NULL;
+    if (query != NULL) {
+        gchar **pairs = g_strsplit(query, "&", -1);
+        for (gchar **p = pairs; *p != NULL; p++) {
+            char *eq = strchr(*p, '=');
+            if (eq == NULL)
+                continue;
+            *eq = '\0';
+            if (g_strcmp0(*p, "action") == 0) {
+                action = g_strdup(eq + 1);
+                break;
+            }
+        }
+        g_strfreev(pairs);
+    }
+
+    if (action == NULL || g_strcmp0(action, "list") == 0) {
+        GString *body = g_string_new(NULL);
+        settings_to_json(body, g_setting_names, g_n_settings, g_secret_names,
+                         g_n_secret);
+        send_simple(conn, "200 OK", "application/json", body->str);
+        g_string_free(body, TRUE);
+        g_free(action);
+        return;
+    }
+
+    if (g_strcmp0(action, "update") == 0) {
+        gchar **pairs = query != NULL ? g_strsplit(query, "&", -1) : NULL;
+        for (gchar **p = pairs; p != NULL && *p != NULL; p++) {
+            char *eq = strchr(*p, '=');
+            if (eq == NULL)
+                continue;
+            *eq = '\0';
+            const char *k = *p;
+            const char *v = eq + 1;
+            if (g_strcmp0(k, "action") == 0)
+                continue;
+            gchar *dk = g_uri_unescape_string(k, NULL);
+            gchar *dv = g_uri_unescape_string(v, NULL);
+            /* Leave a password unchanged when the field is submitted empty
+             * (the list action never returns the current value). */
+            if (dk != NULL && dv != NULL &&
+                !(dv[0] == '\0' && is_secret_name(dk))) {
+                settings_set(dk, dv);
+                if (g_apply_cb != NULL)
+                    g_apply_cb(dk, dv, g_apply_user);
+            }
+            g_free(dk);
+            g_free(dv);
+        }
+        if (pairs != NULL)
+            g_strfreev(pairs);
+        gboolean ok = settings_save();
+        send_simple(conn, ok ? "200 OK" : "500 Internal Server Error",
+                    "text/plain", ok ? "OK\n" : "could not save settings\n");
+        g_free(action);
+        return;
+    }
+
+    send_simple(conn, "400 Bad Request", "text/plain", "unknown action\n");
+    g_free(action);
+}
+
 static void on_request_line(GObject *source, GAsyncResult *res, gpointer user) {
     (void)source;
     struct req_ctx *ctx = user;
@@ -149,10 +247,23 @@ static void on_request_line(GObject *source, GAsyncResult *res, gpointer user) {
         return;
     }
 
-    /* Strip any query string. */
+    /* Separate the query string from the path (keep the query for /settings). */
+    char *query = NULL;
     char *q = strchr(path, '?');
-    if (q != NULL)
+    if (q != NULL) {
         *q = '\0';
+        query = q + 1;
+    }
+
+    /* Settings endpoint: only honoured on the admin config port so a viewer
+     * cannot reach it through the viewer API reverseProxy route. */
+    if (conn_local_port(ctx->conn) == g_config_port &&
+        g_str_has_suffix(path, "/settings")) {
+        handle_config(ctx->conn, query);
+        g_free(line);
+        req_ctx_free(ctx, FALSE);
+        return;
+    }
 
     if (g_str_has_suffix(path, "/stream")) {
         GOutputStream *out =
@@ -225,35 +336,68 @@ static gboolean on_incoming(GSocketService *service,
     return TRUE; /* handled */
 }
 
-gboolean webapi_start(guint16 port, gboolean enabled) {
-    if (!enabled) {
-        syslog(LOG_INFO, "transcription HTTP API disabled");
-        return TRUE;
-    }
+gboolean webapi_start(guint16 api_port, gboolean api_enabled,
+                      guint16 config_port, const char *const *setting_names,
+                      guint n_settings, const char *const *secret_names,
+                      guint n_secret, webapi_apply_cb apply_cb,
+                      void *apply_user) {
+    g_config_port = config_port;
+    g_setting_names = setting_names;
+    g_n_settings = n_settings;
+    g_secret_names = secret_names;
+    g_n_secret = n_secret;
+    g_apply_cb = apply_cb;
+    g_apply_user = apply_user;
 
     GError *err = NULL;
     g_service = g_socket_service_new();
 
+    /* Config server (admin route): always listen so the Settings page works
+     * even when the transcription API is disabled. */
+    if (config_port != 0) {
+        GInetAddress *caddr = g_inet_address_new_from_string("127.0.0.1");
+        GSocketAddress *csaddr = g_inet_socket_address_new(caddr, config_port);
+        gboolean cok = g_socket_listener_add_address(
+            G_SOCKET_LISTENER(g_service), csaddr, G_SOCKET_TYPE_STREAM,
+            G_SOCKET_PROTOCOL_TCP, NULL, NULL, &err);
+        g_object_unref(csaddr);
+        g_object_unref(caddr);
+        if (!cok) {
+            syslog(LOG_ERR, "config server: cannot listen on 127.0.0.1:%u: %s",
+                   config_port, err != NULL ? err->message : "unknown");
+            g_clear_error(&err);
+        } else {
+            syslog(LOG_INFO, "settings config server on 127.0.0.1:%u",
+                   config_port);
+        }
+    }
+
+    if (!api_enabled) {
+        syslog(LOG_INFO, "transcription HTTP API disabled");
+        g_signal_connect(g_service, "incoming", G_CALLBACK(on_incoming), NULL);
+        g_socket_service_start(g_service);
+        return TRUE;
+    }
+
     GInetAddress *addr = g_inet_address_new_from_string("127.0.0.1");
-    GSocketAddress *saddr = g_inet_socket_address_new(addr, port);
+    GSocketAddress *saddr = g_inet_socket_address_new(addr, api_port);
     gboolean ok = g_socket_listener_add_address(
         G_SOCKET_LISTENER(g_service), saddr, G_SOCKET_TYPE_STREAM,
         G_SOCKET_PROTOCOL_TCP, NULL, NULL, &err);
     g_object_unref(saddr);
     g_object_unref(addr);
     if (!ok) {
-        syslog(LOG_ERR, "HTTP API: cannot listen on 127.0.0.1:%u: %s", port,
+        syslog(LOG_ERR, "HTTP API: cannot listen on 127.0.0.1:%u: %s", api_port,
                err != NULL ? err->message : "unknown");
         g_clear_error(&err);
-        g_clear_object(&g_service);
-        return FALSE;
     }
 
     g_signal_connect(g_service, "incoming", G_CALLBACK(on_incoming), NULL);
     g_socket_service_start(g_service);
     transcript_subscribe(sse_broadcast, NULL);
     g_heartbeat_id = g_timeout_add_seconds(15, heartbeat_cb, NULL);
-    syslog(LOG_INFO, "transcription HTTP API listening on 127.0.0.1:%u", port);
+    syslog(LOG_INFO, "transcription HTTP API listening on 127.0.0.1:%u",
+           api_port);
     return TRUE;
 }
 

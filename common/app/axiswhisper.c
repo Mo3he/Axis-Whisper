@@ -43,6 +43,7 @@
 #include "whisper.h"
 
 #include "mqtt.h"
+#include "settings.h"
 #include "transcript.h"
 #include "webapi.h"
 
@@ -133,6 +134,11 @@
  * target in manifest.json. */
 #define API_PORT 2721
 
+/* Localhost port for the settings config endpoint (admin reverseProxy route).
+ * Kept separate from API_PORT so the device can enforce admin access on
+ * settings writes while the transcription API stays viewer-accessible. */
+#define CONFIG_PORT 2722
+
 /* ------------------------------------------------------------------ */
 /* Shared state                                                        */
 /* ------------------------------------------------------------------ */
@@ -169,6 +175,25 @@ struct axoverlay_api {
 };
 
 static struct axoverlay_api g_axoverlay = {0};
+
+/* Cairo is only used from the overlay render callback, so like axoverlay it is
+ * loaded at runtime and treated as optional: on devices without the video /
+ * overlay stack neither library is present, and the app still transcribes. */
+struct cairo_api {
+    void *handle;
+    typeof(cairo_set_operator) *set_operator;
+    typeof(cairo_set_source_rgba) *set_source_rgba;
+    typeof(cairo_paint) *paint;
+    typeof(cairo_select_font_face) *select_font_face;
+    typeof(cairo_set_font_size) *set_font_size;
+    typeof(cairo_text_extents) *text_extents;
+    typeof(cairo_rectangle) *rectangle;
+    typeof(cairo_fill) *fill;
+    typeof(cairo_move_to) *move_to;
+    typeof(cairo_show_text) *show_text;
+};
+
+static struct cairo_api g_cairo = {0};
 
 /* Optional path to a user-supplied model (downloaded from ModelUrl); when set
  * it is loaded in preference to the bundled ggml-*.bin. */
@@ -503,7 +528,7 @@ static int wrap_text(cairo_t *cr,
             g_snprintf(candidate, sizeof(candidate), "%s %s", cur, *w);
 
         cairo_text_extents_t ext;
-        cairo_text_extents(cr, candidate, &ext);
+        g_cairo.text_extents(cr, candidate, &ext);
         if (ext.width <= max_width || cur[0] == '\0') {
             g_strlcpy(cur, candidate, sizeof(cur));
         } else {
@@ -540,10 +565,10 @@ static void render_overlay_cb(gpointer render_context,
     cairo_t *cr = (cairo_t *)render_context;
 
     /* Clear to fully transparent */
-    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0, 0, 0, 0);
-    cairo_paint(cr);
-    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    g_cairo.set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    g_cairo.set_source_rgba(cr, 0, 0, 0, 0);
+    g_cairo.paint(cr);
+    g_cairo.set_operator(cr, CAIRO_OPERATOR_OVER);
 
     char text[SUBTITLE_MAX];
     pthread_mutex_lock(&g_sub_lock);
@@ -558,9 +583,9 @@ static void render_overlay_cb(gpointer render_context,
         return; /* transcription still runs; nothing is burned into video */
 
     double font_size = overlay_height / 3.2 * cfg.font_scale;
-    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL,
-                           CAIRO_FONT_WEIGHT_BOLD);
-    cairo_set_font_size(cr, font_size);
+    g_cairo.select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL,
+                             CAIRO_FONT_WEIGHT_BOLD);
+    g_cairo.set_font_size(cr, font_size);
 
     char lines[MAX_LINES][SUBTITLE_MAX];
     int n_lines = wrap_text(cr, text, overlay_width * 0.92, cfg.max_lines, lines);
@@ -573,20 +598,20 @@ static void render_overlay_cb(gpointer render_context,
 
     for (int i = 0; i < n_lines; i++) {
         cairo_text_extents_t ext;
-        cairo_text_extents(cr, lines[i], &ext);
+        g_cairo.text_extents(cr, lines[i], &ext);
         double tx = (overlay_width - ext.width) / 2.0;
         double baseline = block_top + line_h * i + font_size;
 
         /* Semi-transparent backing box */
-        cairo_set_source_rgba(cr, 0, 0, 0, cfg.bg_opacity);
-        cairo_rectangle(cr, tx - pad, baseline - font_size, ext.width + 2 * pad,
-                        line_h);
-        cairo_fill(cr);
+        g_cairo.set_source_rgba(cr, 0, 0, 0, cfg.bg_opacity);
+        g_cairo.rectangle(cr, tx - pad, baseline - font_size,
+                          ext.width + 2 * pad, line_h);
+        g_cairo.fill(cr);
 
         /* Subtitle text */
-        cairo_set_source_rgba(cr, cfg.text_r, cfg.text_g, cfg.text_b, 1);
-        cairo_move_to(cr, tx, baseline);
-        cairo_show_text(cr, lines[i]);
+        g_cairo.set_source_rgba(cr, cfg.text_r, cfg.text_g, cfg.text_b, 1);
+        g_cairo.move_to(cr, tx, baseline);
+        g_cairo.show_text(cr, lines[i]);
     }
 }
 
@@ -668,11 +693,115 @@ static struct pw_stream *g_pw_stream = NULL;
 static struct spa_hook g_pw_stream_listener;
 static uint32_t g_pw_node_id = SPA_ID_INVALID;
 
+/* PipeWire is only used for LOCAL microphone capture. On devices without a
+ * local audio pipeline (e.g. video-less units used purely with remote audio)
+ * libpipewire is absent, so like axoverlay/cairo it is loaded at runtime and
+ * only when local capture is actually requested. The header still provides the
+ * types, constants and inline/vtable helpers (PW_KEY_*, spa_* builders,
+ * pw_core_get_registry, pw_registry_add_listener); only the real exported
+ * functions are bound here. */
+struct pw_api {
+    void *handle;
+    typeof(pw_init) *init;
+    typeof(pw_deinit) *deinit;
+    typeof(pw_thread_loop_new) *thread_loop_new;
+    typeof(pw_thread_loop_start) *thread_loop_start;
+    typeof(pw_thread_loop_lock) *thread_loop_lock;
+    typeof(pw_thread_loop_unlock) *thread_loop_unlock;
+    typeof(pw_thread_loop_stop) *thread_loop_stop;
+    typeof(pw_thread_loop_destroy) *thread_loop_destroy;
+    typeof(pw_thread_loop_get_loop) *thread_loop_get_loop;
+    typeof(pw_context_new) *context_new;
+    typeof(pw_context_connect) *context_connect;
+    typeof(pw_context_destroy) *context_destroy;
+    typeof(pw_core_disconnect) *core_disconnect;
+    typeof(pw_proxy_destroy) *proxy_destroy;
+    typeof(pw_stream_new) *stream_new;
+    typeof(pw_stream_add_listener) *stream_add_listener;
+    typeof(pw_stream_connect) *stream_connect;
+    typeof(pw_stream_destroy) *stream_destroy;
+    typeof(pw_stream_dequeue_buffer) *stream_dequeue_buffer;
+    typeof(pw_stream_queue_buffer) *stream_queue_buffer;
+    typeof(pw_stream_state_as_string) *stream_state_as_string;
+    typeof(pw_properties_new) *properties_new;
+};
+
+static struct pw_api g_pw = {0};
+
+static bool load_pw_symbol(void *handle, void **slot, const char *name) {
+    dlerror();
+    *slot = dlsym(handle, name);
+    if (*slot != NULL)
+        return true;
+
+    syslog(LOG_WARNING, "missing pipewire symbol %s: %s", name,
+           dlerror() != NULL ? dlerror() : "unknown");
+    return false;
+}
+
+static bool load_pw_api(void) {
+    if (g_pw.handle != NULL)
+        return true;
+
+    g_pw.handle = dlopen("libpipewire-0.3.so.0", RTLD_NOW | RTLD_LOCAL);
+    if (g_pw.handle == NULL) {
+        syslog(LOG_WARNING, "pipewire unavailable: %s", dlerror());
+        return false;
+    }
+
+    void *h = g_pw.handle;
+    if (!load_pw_symbol(h, (void **)&g_pw.init, "pw_init") ||
+        !load_pw_symbol(h, (void **)&g_pw.deinit, "pw_deinit") ||
+        !load_pw_symbol(h, (void **)&g_pw.thread_loop_new,
+                        "pw_thread_loop_new") ||
+        !load_pw_symbol(h, (void **)&g_pw.thread_loop_start,
+                        "pw_thread_loop_start") ||
+        !load_pw_symbol(h, (void **)&g_pw.thread_loop_lock,
+                        "pw_thread_loop_lock") ||
+        !load_pw_symbol(h, (void **)&g_pw.thread_loop_unlock,
+                        "pw_thread_loop_unlock") ||
+        !load_pw_symbol(h, (void **)&g_pw.thread_loop_stop,
+                        "pw_thread_loop_stop") ||
+        !load_pw_symbol(h, (void **)&g_pw.thread_loop_destroy,
+                        "pw_thread_loop_destroy") ||
+        !load_pw_symbol(h, (void **)&g_pw.thread_loop_get_loop,
+                        "pw_thread_loop_get_loop") ||
+        !load_pw_symbol(h, (void **)&g_pw.context_new, "pw_context_new") ||
+        !load_pw_symbol(h, (void **)&g_pw.context_connect,
+                        "pw_context_connect") ||
+        !load_pw_symbol(h, (void **)&g_pw.context_destroy,
+                        "pw_context_destroy") ||
+        !load_pw_symbol(h, (void **)&g_pw.core_disconnect,
+                        "pw_core_disconnect") ||
+        !load_pw_symbol(h, (void **)&g_pw.proxy_destroy, "pw_proxy_destroy") ||
+        !load_pw_symbol(h, (void **)&g_pw.stream_new, "pw_stream_new") ||
+        !load_pw_symbol(h, (void **)&g_pw.stream_add_listener,
+                        "pw_stream_add_listener") ||
+        !load_pw_symbol(h, (void **)&g_pw.stream_connect,
+                        "pw_stream_connect") ||
+        !load_pw_symbol(h, (void **)&g_pw.stream_destroy,
+                        "pw_stream_destroy") ||
+        !load_pw_symbol(h, (void **)&g_pw.stream_dequeue_buffer,
+                        "pw_stream_dequeue_buffer") ||
+        !load_pw_symbol(h, (void **)&g_pw.stream_queue_buffer,
+                        "pw_stream_queue_buffer") ||
+        !load_pw_symbol(h, (void **)&g_pw.stream_state_as_string,
+                        "pw_stream_state_as_string") ||
+        !load_pw_symbol(h, (void **)&g_pw.properties_new,
+                        "pw_properties_new")) {
+        dlclose(g_pw.handle);
+        memset(&g_pw, 0, sizeof(g_pw));
+        return false;
+    }
+
+    return true;
+}
+
 /* Runs in the PipeWire loop thread. The stream is negotiated to 16 kHz
  * mono S16, so samples go straight into the ring buffer. */
 static void on_pw_process(void *data) {
     (void)data;
-    struct pw_buffer *b = pw_stream_dequeue_buffer(g_pw_stream);
+    struct pw_buffer *b = g_pw.stream_dequeue_buffer(g_pw_stream);
     if (b == NULL)
         return;
     struct spa_data *d = &b->buffer->datas[0];
@@ -680,7 +809,7 @@ static void on_pw_process(void *data) {
         const int16_t *samples = SPA_PTROFF(d->data, d->chunk->offset, const int16_t);
         ring_push(samples, d->chunk->size / sizeof(int16_t));
     }
-    pw_stream_queue_buffer(g_pw_stream, b);
+    g_pw.stream_queue_buffer(g_pw_stream, b);
 }
 
 static void on_pw_state_changed(void *data,
@@ -690,7 +819,7 @@ static void on_pw_state_changed(void *data,
     (void)data;
     (void)old;
     syslog(LOG_INFO, "capture stream state: %s%s%s",
-           pw_stream_state_as_string(state), error != NULL ? " - " : "",
+           g_pw.stream_state_as_string(state), error != NULL ? " - " : "",
            error != NULL ? error : "");
 }
 
@@ -725,16 +854,16 @@ static void on_registry_global(void *data,
            id);
 
     struct pw_properties *stream_props =
-        pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio",
-                          PW_KEY_MEDIA_CATEGORY, "Capture",
-                          PW_KEY_TARGET_OBJECT, name, NULL);
-    g_pw_stream = pw_stream_new(g_pw_core, "whisper-subtitles", stream_props);
+        g_pw.properties_new(PW_KEY_MEDIA_TYPE, "Audio",
+                            PW_KEY_MEDIA_CATEGORY, "Capture",
+                            PW_KEY_TARGET_OBJECT, name, NULL);
+    g_pw_stream = g_pw.stream_new(g_pw_core, "whisper-subtitles", stream_props);
     if (g_pw_stream == NULL) {
         syslog(LOG_ERR, "pw_stream_new failed");
         return;
     }
-    pw_stream_add_listener(g_pw_stream, &g_pw_stream_listener,
-                           &pw_stream_events_impl, NULL);
+    g_pw.stream_add_listener(g_pw_stream, &g_pw_stream_listener,
+                             &pw_stream_events_impl, NULL);
 
     /* Ask for exactly what whisper wants; the stream adapter resamples
      * and downmixes from the device native format. */
@@ -747,13 +876,13 @@ static void on_registry_global(void *data,
                                  .rate = SAMPLE_RATE,
                                  .channels = 1));
 
-    int res = pw_stream_connect(g_pw_stream, PW_DIRECTION_INPUT, PW_ID_ANY,
-                                PW_STREAM_FLAG_AUTOCONNECT |
-                                    PW_STREAM_FLAG_MAP_BUFFERS,
-                                params, 1);
+    int res = g_pw.stream_connect(g_pw_stream, PW_DIRECTION_INPUT, PW_ID_ANY,
+                                  PW_STREAM_FLAG_AUTOCONNECT |
+                                      PW_STREAM_FLAG_MAP_BUFFERS,
+                                  params, 1);
     if (res < 0) {
         syslog(LOG_ERR, "pw_stream_connect failed: %s", strerror(-res));
-        pw_stream_destroy(g_pw_stream);
+        g_pw.stream_destroy(g_pw_stream);
         g_pw_stream = NULL;
         return;
     }
@@ -765,7 +894,7 @@ static void on_registry_global_remove(void *data, uint32_t id) {
     if (g_pw_stream != NULL && id == g_pw_node_id) {
         syslog(LOG_WARNING, "capture node removed, waiting for a new one");
         spa_hook_remove(&g_pw_stream_listener);
-        pw_stream_destroy(g_pw_stream);
+        g_pw.stream_destroy(g_pw_stream);
         g_pw_stream = NULL;
         g_pw_node_id = SPA_ID_INVALID;
     }
@@ -778,24 +907,29 @@ static const struct pw_registry_events pw_registry_events_impl = {
 };
 
 static bool start_audio(void) {
-    pw_init(NULL, NULL);
-    g_pw_loop = pw_thread_loop_new("audio-capture", NULL);
-    if (g_pw_loop == NULL || pw_thread_loop_start(g_pw_loop) != 0) {
+    if (!load_pw_api()) {
+        syslog(LOG_ERR, "local audio capture unavailable (no PipeWire on this "
+                        "device); set RemoteAudioHost to use remote audio");
+        return false;
+    }
+    g_pw.init(NULL, NULL);
+    g_pw_loop = g_pw.thread_loop_new("audio-capture", NULL);
+    if (g_pw_loop == NULL || g_pw.thread_loop_start(g_pw_loop) != 0) {
         syslog(LOG_ERR, "failed to start PipeWire loop");
         return false;
     }
 
-    pw_thread_loop_lock(g_pw_loop);
-    g_pw_context = pw_context_new(pw_thread_loop_get_loop(g_pw_loop), NULL, 0);
+    g_pw.thread_loop_lock(g_pw_loop);
+    g_pw_context = g_pw.context_new(g_pw.thread_loop_get_loop(g_pw_loop), NULL, 0);
     if (g_pw_context != NULL)
-        g_pw_core = pw_context_connect(g_pw_context, NULL, 0);
+        g_pw_core = g_pw.context_connect(g_pw_context, NULL, 0);
     if (g_pw_core != NULL) {
         g_pw_registry = pw_core_get_registry(g_pw_core, PW_VERSION_REGISTRY, 0);
         if (g_pw_registry != NULL)
             pw_registry_add_listener(g_pw_registry, &g_pw_registry_listener,
                                      &pw_registry_events_impl, NULL);
     }
-    pw_thread_loop_unlock(g_pw_loop);
+    g_pw.thread_loop_unlock(g_pw_loop);
 
     if (g_pw_registry == NULL) {
         syslog(LOG_ERR, "cannot connect to PipeWire - is audio enabled on the "
@@ -808,26 +942,26 @@ static bool start_audio(void) {
 static void stop_audio(void) {
     if (g_pw_loop == NULL)
         return;
-    pw_thread_loop_lock(g_pw_loop);
+    g_pw.thread_loop_lock(g_pw_loop);
     if (g_pw_stream != NULL) {
         spa_hook_remove(&g_pw_stream_listener);
-        pw_stream_destroy(g_pw_stream);
+        g_pw.stream_destroy(g_pw_stream);
         g_pw_stream = NULL;
     }
     if (g_pw_registry != NULL) {
         spa_hook_remove(&g_pw_registry_listener);
-        pw_proxy_destroy((struct pw_proxy *)g_pw_registry);
+        g_pw.proxy_destroy((struct pw_proxy *)g_pw_registry);
         g_pw_registry = NULL;
     }
-    pw_thread_loop_unlock(g_pw_loop);
-    pw_thread_loop_stop(g_pw_loop);
+    g_pw.thread_loop_unlock(g_pw_loop);
+    g_pw.thread_loop_stop(g_pw_loop);
     if (g_pw_core != NULL)
-        pw_core_disconnect(g_pw_core);
+        g_pw.core_disconnect(g_pw_core);
     if (g_pw_context != NULL)
-        pw_context_destroy(g_pw_context);
-    pw_thread_loop_destroy(g_pw_loop);
+        g_pw.context_destroy(g_pw_context);
+    g_pw.thread_loop_destroy(g_pw_loop);
     g_pw_loop = NULL;
-    pw_deinit();
+    g_pw.deinit();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1429,13 +1563,13 @@ static gboolean signal_handler_cb(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
-static bool load_overlay_symbol(void **slot, const char *name) {
+static bool load_overlay_symbol(void *handle, void **slot, const char *name) {
     dlerror();
-    *slot = dlsym(g_axoverlay.handle, name);
+    *slot = dlsym(handle, name);
     if (*slot != NULL)
         return true;
 
-    syslog(LOG_WARNING, "missing axoverlay symbol %s: %s", name,
+    syslog(LOG_WARNING, "missing overlay symbol %s: %s", name,
            dlerror() != NULL ? dlerror() : "unknown");
     return false;
 }
@@ -1444,8 +1578,45 @@ static void unload_overlay_api(void) {
     if (g_axoverlay.handle != NULL)
         dlclose(g_axoverlay.handle);
     memset(&g_axoverlay, 0, sizeof(g_axoverlay));
+    if (g_cairo.handle != NULL)
+        dlclose(g_cairo.handle);
+    memset(&g_cairo, 0, sizeof(g_cairo));
     g_overlay_available = false;
     g_overlay_id = -1;
+}
+
+static bool load_cairo_api(void) {
+    if (g_cairo.handle != NULL)
+        return true;
+
+    g_cairo.handle = dlopen("libcairo.so.2", RTLD_NOW | RTLD_LOCAL);
+    if (g_cairo.handle == NULL) {
+        syslog(LOG_WARNING, "cairo unavailable: %s", dlerror());
+        return false;
+    }
+
+    void *h = g_cairo.handle;
+    if (!load_overlay_symbol(h, (void **)&g_cairo.set_operator,
+                             "cairo_set_operator") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.set_source_rgba,
+                             "cairo_set_source_rgba") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.paint, "cairo_paint") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.select_font_face,
+                             "cairo_select_font_face") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.set_font_size,
+                             "cairo_set_font_size") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.text_extents,
+                             "cairo_text_extents") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.rectangle,
+                             "cairo_rectangle") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.fill, "cairo_fill") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.move_to, "cairo_move_to") ||
+        !load_overlay_symbol(h, (void **)&g_cairo.show_text,
+                             "cairo_show_text")) {
+        return false;
+    }
+
+    return true;
 }
 
 static bool load_overlay_api(void) {
@@ -1458,26 +1629,28 @@ static bool load_overlay_api(void) {
         return false;
     }
 
-    if (!load_overlay_symbol((void **)&g_axoverlay.redraw,
+    void *h = g_axoverlay.handle;
+    if (!load_overlay_symbol(h, (void **)&g_axoverlay.redraw,
                              "axoverlay_redraw") ||
-        !load_overlay_symbol((void **)&g_axoverlay.is_backend_supported,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.is_backend_supported,
                              "axoverlay_is_backend_supported") ||
-        !load_overlay_symbol((void **)&g_axoverlay.init_settings,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.init_settings,
                              "axoverlay_init_axoverlay_settings") ||
-        !load_overlay_symbol((void **)&g_axoverlay.init,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.init,
                              "axoverlay_init") ||
-        !load_overlay_symbol((void **)&g_axoverlay.init_overlay_data,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.init_overlay_data,
                              "axoverlay_init_overlay_data") ||
-        !load_overlay_symbol((void **)&g_axoverlay.get_max_resolution_width,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.get_max_resolution_width,
                              "axoverlay_get_max_resolution_width") ||
-        !load_overlay_symbol((void **)&g_axoverlay.get_max_resolution_height,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.get_max_resolution_height,
                              "axoverlay_get_max_resolution_height") ||
-        !load_overlay_symbol((void **)&g_axoverlay.create_overlay,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.create_overlay,
                              "axoverlay_create_overlay") ||
-        !load_overlay_symbol((void **)&g_axoverlay.destroy_overlay,
+        !load_overlay_symbol(h, (void **)&g_axoverlay.destroy_overlay,
                              "axoverlay_destroy_overlay") ||
-        !load_overlay_symbol((void **)&g_axoverlay.cleanup,
-                             "axoverlay_cleanup")) {
+        !load_overlay_symbol(h, (void **)&g_axoverlay.cleanup,
+                             "axoverlay_cleanup") ||
+        !load_cairo_api()) {
         unload_overlay_api();
         return false;
     }
@@ -1648,6 +1821,74 @@ static gchar *download_user_model(const char *url) {
     return g_strdup(model_path);
 }
 
+/* Full set of app settings with their defaults, mirroring the manifest
+ * paramConfig. This is the source of truth for the app's own Settings web page
+ * and is used to seed the settings file on devices without the VAPIX parameter
+ * system (e.g. recorders such as the S3008). */
+struct setting_def {
+    const char *name;
+    const char *def;
+};
+
+static const struct setting_def SETTINGS[] = {
+    {"MicSensitivity", "Normal"},      {"SilenceTimeoutMs", "800"},
+    {"MinSpeechMs", "300"},            {"MaxUtteranceSec", "6"},
+    {"SubtitleDurationSec", "6"},      {"FontScale", "Medium"},
+    {"SubtitlePosition", "Bottom"},    {"StreamingCaptions", "yes"},
+    {"SubtitlesEnabled", "yes"},       {"MaxLines", "2"},
+    {"BarHeightPct", "20"},            {"BackgroundOpacity", "55"},
+    {"TextColor", "#FFFFFF"},          {"InferenceThreads", "3"},
+    {"Language", "en"},                {"Translate", "no"},
+    {"MaxTokens", "64"},               {"TemperatureFallback", "no"},
+    {"NoiseGuardMargin", "8.0"},       {"MinSignalPeak", "0.02"},
+    {"MaxGain", "4.0"},                {"StreamStepMs", "900"},
+    {"ModelUrl", ""},                  {"ApiEnabled", "yes"},
+    {"MqttEnabled", "no"},             {"MqttHost", ""},
+    {"MqttPort", "1883"},              {"MqttTls", "no"},
+    {"MqttTlsVerify", "no"},           {"MqttUser", ""},
+    {"MqttPass", ""},                  {"MqttTopic", "whisper/subtitles"},
+    {"MqttClientId", ""},              {"MqttPublishPartials", "no"},
+    {"RemoteAudioHost", ""},           {"RemoteAudioUser", ""},
+    {"RemoteAudioPass", ""},
+};
+
+static const char *g_setting_names[G_N_ELEMENTS(SETTINGS)];
+
+/* Password settings: never written to the settings file or returned to the
+ * browser. They are read from the device parameter system at runtime, or set
+ * (write-only) from the Settings page. */
+static const char *const SECRET_SETTINGS[] = {
+    "MqttPass",
+    "RemoteAudioPass",
+};
+
+static gboolean is_secret_setting(const char *name) {
+    for (guint i = 0; i < G_N_ELEMENTS(SECRET_SETTINGS); i++)
+        if (g_strcmp0(name, SECRET_SETTINGS[i]) == 0)
+            return TRUE;
+    return FALSE;
+}
+
+/* Resolve a setting: a non-empty settings-file value wins (the source of
+ * truth, available on every device), otherwise the VAPIX parameter system
+ * (axparameter). An empty file value falls through so unset/secret values are
+ * taken from the device parameter system where present. Caller frees. */
+static gchar *setting_read(AXParameter *params, const char *name) {
+    gchar *v = settings_get(name);
+    if (v != NULL && v[0] != '\0')
+        return v;
+    g_free(v);
+    return param_get(params, name);
+}
+
+/* Apply a setting written through the config endpoint. Live-tunable settings
+ * take effect immediately; startup-only ones are ignored here (they are read
+ * at startup) and take effect on the next app restart. */
+static void apply_setting_cb(const char *name, const char *value, void *user) {
+    (void)user;
+    cfg_apply(name, value);
+}
+
 int main(void) {
     openlog(APP_NAME, LOG_PID, LOG_USER);
     syslog(LOG_INFO, "starting %s", APP_NAME);
@@ -1659,9 +1900,18 @@ int main(void) {
     transcript_init();
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    /* Read settings (from the Settings web page / VAPIX) before creating the
-     * overlay, and keep the AXParameter handle alive so later changes are
-     * delivered live to param_changed_cb for the lifetime of the app.
+    /* Settings are stored in a file in the app's writable localdata directory
+     * so the Settings web page works on devices that do not serve the VAPIX
+     * parameter system / param.cgi (e.g. recorders such as the S3008). The
+     * device parameter system is still used for live change callbacks and as a
+     * fallback where present, but this file is the source of truth. */
+    settings_init(PKG_DIR "/localdata/settings.conf");
+    for (guint i = 0; i < G_N_ELEMENTS(SETTINGS); i++)
+        g_setting_names[i] = SETTINGS[i].name;
+
+    /* Read settings before creating the overlay, and keep the AXParameter
+     * handle alive so later VAPIX changes are delivered live to
+     * param_changed_cb for the lifetime of the app.
      *
      * RemoteAudioHost set -> pull audio from another Axis device;
      * empty -> capture from this camera via PipeWire. */
@@ -1685,62 +1935,96 @@ int main(void) {
     GError *perr = NULL;
     AXParameter *params = ax_parameter_new(APP_NAME, &perr);
     if (params != NULL) {
+        /* Register live-change callbacks for the tunable parameters where the
+         * parameter system is available. */
         for (guint i = 0; i < G_N_ELEMENTS(tuning_params); i++)
             load_and_watch(params, tuning_params[i]);
-        ax_parameter_get(params, "RemoteAudioHost", &remote_host, NULL);
-        ax_parameter_get(params, "RemoteAudioUser", &remote_user, NULL);
-        ax_parameter_get(params, "RemoteAudioPass", &remote_pass, NULL);
-        model_url = param_get(params, "ModelUrl");
-
-        gchar *v;
-        if ((v = param_get(params, "ApiEnabled")) != NULL) {
-            api_enabled = parse_bool(v);
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttEnabled")) != NULL) {
-            mcfg.enabled = parse_bool(v);
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttHost")) != NULL) {
-            g_strlcpy(mcfg.host, v, sizeof(mcfg.host));
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttPort")) != NULL) {
-            mcfg.port = atoi(v);
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttTls")) != NULL) {
-            mcfg.tls = parse_bool(v);
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttTlsVerify")) != NULL) {
-            mcfg.tls_verify = parse_bool(v);
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttUser")) != NULL) {
-            g_strlcpy(mcfg.user, v, sizeof(mcfg.user));
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttPass")) != NULL) {
-            g_strlcpy(mcfg.pass, v, sizeof(mcfg.pass));
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttTopic")) != NULL) {
-            g_strlcpy(mcfg.topic, v, sizeof(mcfg.topic));
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttClientId")) != NULL) {
-            g_strlcpy(mcfg.client_id, v, sizeof(mcfg.client_id));
-            g_free(v);
-        }
-        if ((v = param_get(params, "MqttPublishPartials")) != NULL) {
-            mcfg.publish_partials = parse_bool(v);
-            g_free(v);
-        }
     } else {
         syslog(LOG_WARNING, "axparameter unavailable: %s",
                perr != NULL ? perr->message : "unknown");
         g_clear_error(&perr);
+    }
+
+    /* Seed the settings file for any setting it does not yet contain, taking
+     * an existing VAPIX value (pre-upgrade) if present, else the default, so
+     * the Settings page always returns meaningful values. Passwords are never
+     * written to the file; they stay in the device parameter system. */
+    gboolean seeded = FALSE;
+    for (guint i = 0; i < G_N_ELEMENTS(SETTINGS); i++) {
+        if (is_secret_setting(SETTINGS[i].name))
+            continue;
+        gchar *fv = settings_get(SETTINGS[i].name);
+        if (fv != NULL) {
+            g_free(fv);
+            continue;
+        }
+        gchar *av = param_get(params, SETTINGS[i].name);
+        settings_set(SETTINGS[i].name, av != NULL ? av : SETTINGS[i].def);
+        g_free(av);
+        seeded = TRUE;
+    }
+    if (seeded)
+        settings_save();
+
+    /* Apply the effective values (file wins) for live-tunable settings. */
+    for (guint i = 0; i < G_N_ELEMENTS(tuning_params); i++) {
+        gchar *v = setting_read(params, tuning_params[i]);
+        if (v != NULL) {
+            cfg_apply(tuning_params[i], v);
+            g_free(v);
+        }
+    }
+
+    /* Startup-only settings (need an app restart to change). */
+    remote_host = setting_read(params, "RemoteAudioHost");
+    remote_user = setting_read(params, "RemoteAudioUser");
+    remote_pass = setting_read(params, "RemoteAudioPass");
+    model_url = setting_read(params, "ModelUrl");
+
+    gchar *v;
+    if ((v = setting_read(params, "ApiEnabled")) != NULL) {
+        api_enabled = parse_bool(v);
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttEnabled")) != NULL) {
+        mcfg.enabled = parse_bool(v);
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttHost")) != NULL) {
+        g_strlcpy(mcfg.host, v, sizeof(mcfg.host));
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttPort")) != NULL) {
+        mcfg.port = atoi(v);
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttTls")) != NULL) {
+        mcfg.tls = parse_bool(v);
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttTlsVerify")) != NULL) {
+        mcfg.tls_verify = parse_bool(v);
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttUser")) != NULL) {
+        g_strlcpy(mcfg.user, v, sizeof(mcfg.user));
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttPass")) != NULL) {
+        g_strlcpy(mcfg.pass, v, sizeof(mcfg.pass));
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttTopic")) != NULL) {
+        g_strlcpy(mcfg.topic, v, sizeof(mcfg.topic));
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttClientId")) != NULL) {
+        g_strlcpy(mcfg.client_id, v, sizeof(mcfg.client_id));
+        g_free(v);
+    }
+    if ((v = setting_read(params, "MqttPublishPartials")) != NULL) {
+        mcfg.publish_partials = parse_bool(v);
+        g_free(v);
     }
 
     if (!setup_overlay())
@@ -1761,13 +2045,11 @@ int main(void) {
     g_free(remote_user);
     g_free(remote_pass);
 
-    if (!audio_ok) {
-        if (params != NULL)
-            ax_parameter_free(params);
-        cleanup_overlay();
-        g_main_loop_unref(g_loop);
-        return 1;
-    }
+    if (!audio_ok)
+        syslog(LOG_WARNING,
+               "no audio source active; the app is idle and serving its "
+               "Settings page. Set RemoteAudioHost (or enable the camera mic) "
+               "and restart the app.");
 
     g_unix_signal_add(SIGTERM, signal_handler_cb, NULL);
     g_unix_signal_add(SIGINT, signal_handler_cb, NULL);
@@ -1778,12 +2060,23 @@ int main(void) {
     g_model_path_override = download_user_model(model_url);
     g_free(model_url);
 
-    /* Expose transcriptions to other systems. */
-    webapi_start(API_PORT, api_enabled);
+    /* Expose transcriptions to other systems, and serve the settings config
+     * endpoint (admin route) so the Settings page works without param.cgi.
+     * This runs even with no audio source so settings stay editable on
+     * devices that need to be pointed at a remote audio source first. */
+    webapi_start(API_PORT, api_enabled, CONFIG_PORT, g_setting_names,
+                 G_N_ELEMENTS(SETTINGS), SECRET_SETTINGS,
+                 G_N_ELEMENTS(SECRET_SETTINGS), apply_setting_cb, NULL);
     mqtt_start(&mcfg);
 
+    /* Transcription only runs when there is an audio source; otherwise the app
+     * idles (serving Settings/API) until reconfigured and restarted. */
     pthread_t transcribe_tid;
-    pthread_create(&transcribe_tid, NULL, transcribe_thread, NULL);
+    bool transcribe_started = false;
+    if (audio_ok) {
+        pthread_create(&transcribe_tid, NULL, transcribe_thread, NULL);
+        transcribe_started = true;
+    }
 
     g_main_loop_run(g_loop);
 
@@ -1794,7 +2087,8 @@ int main(void) {
     stop_audio();
     if (g_remote_started)
         pthread_join(g_remote_tid, NULL);
-    pthread_join(transcribe_tid, NULL);
+    if (transcribe_started)
+        pthread_join(transcribe_tid, NULL);
     curl_global_cleanup();
 
     cleanup_overlay();

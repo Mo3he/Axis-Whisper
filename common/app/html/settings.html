@@ -354,7 +354,9 @@
   }
 
   function param(action, query) {
-    var url = "/axis-cgi/param.cgi?action=" + action + (query ? "&" + query : "");
+    // Settings are served by the app itself (admin reverseProxy route), so the
+    // page works on devices that do not serve VAPIX param.cgi (e.g. the S3008).
+    var url = "config/settings?action=" + action + (query ? "&" + query : "");
     return fetch(url, { credentials: "same-origin", cache: "no-store" })
       .then(function (r) {
         if (!r.ok) throw new Error("HTTP " + r.status);
@@ -364,18 +366,12 @@
 
   function load() {
     setStatus("Loading...");
-    return param("list", "group=" + GROUP).then(function (text) {
+    return param("list").then(function (text) {
       var map = {};
-      text.split(/\r?\n/).forEach(function (line) {
-        var i = line.indexOf("=");
-        if (i > 0) {
-          var name = line.slice(0, i).split(".").pop();
-          map[name] = line.slice(i + 1);
-        }
-      });
+      try { map = JSON.parse(text); } catch (e) { map = {}; }
       FIELDS.forEach(function (name) {
         var el = document.getElementById(name);
-        if (el && map.hasOwnProperty(name)) el.value = map[name];
+        if (el && map.hasOwnProperty(name) && map[name] !== "") el.value = map[name];
       });
       setStatus("");
     }).catch(function (e) {
@@ -409,7 +405,7 @@
     var parts = [];
     FIELDS.forEach(function (name) {
       var el = document.getElementById(name);
-      if (el) parts.push(GROUP + "." + name + "=" + encodeURIComponent(el.value));
+      if (el) parts.push(name + "=" + encodeURIComponent(el.value));
     });
     setStatus("Saving...");
     setBusy(true);
