@@ -20,7 +20,7 @@
             "vendor": "Mo3he",
             "vendorId": "5741c1fb91",
             "vendorUrl": "https://github.com/Mo3he/Axis-Whisper",
-            "version": "0.2.7",
+            "version": "0.2.8",
             "architecture": "aarch64",
             "runMode": "never",
             "compatibleOsVersions": [
@@ -98,6 +98,11 @@
                     "name": "RemoteAudioPass",
                     "default": "",
                     "type": "password"
+                },
+                {
+                    "name": "AudioInput",
+                    "default": "",
+                    "type": "string"
                 },
                 {
                     "name": "SubtitlesEnabled",

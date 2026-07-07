@@ -693,6 +693,17 @@ static struct pw_stream *g_pw_stream = NULL;
 static struct spa_hook g_pw_stream_listener;
 static uint32_t g_pw_node_id = SPA_ID_INVALID;
 
+/* Capture source selection. PipeWire on Axis devices exposes a silent fallback
+ * 'dummy-source' node alongside the real microphone(s); binding the first
+ * Audio/Source that appears often grabs the dummy. So we log every source, skip
+ * the dummy, optionally pick one the user selected by name (AudioInput), and
+ * only fall back to the dummy if nothing better appears. */
+static char g_audio_input[128] = "";  /* user selection substring; "" = auto */
+static bool g_capture_bound = false;
+static uint32_t g_fallback_id = SPA_ID_INVALID;
+static char g_fallback_name[256] = "";
+static guint g_fallback_timer_id = 0;
+
 /* PipeWire is only used for LOCAL microphone capture. On devices without a
  * local audio pipeline (e.g. video-less units used purely with remote audio)
  * libpipewire is absent, so like axoverlay/cairo it is loaded at runtime and
@@ -829,30 +840,25 @@ static const struct pw_stream_events pw_stream_events_impl = {
     .state_changed = on_pw_state_changed,
 };
 
-/* Called from the PipeWire loop thread for every global object; attach a
- * capture stream to the first audio source node that appears. */
-static void on_registry_global(void *data,
-                               uint32_t id,
-                               uint32_t permissions,
-                               const char *type,
-                               uint32_t version,
-                               const struct spa_dict *props) {
-    (void)data;
-    (void)permissions;
-    (void)version;
+/* Case-insensitive substring match of want against a node's name/description. */
+static bool source_matches(const char *name, const char *desc,
+                           const char *want) {
+    if (want == NULL || want[0] == '\0')
+        return false;
+    gchar *lw = g_ascii_strdown(want, -1);
+    gchar *ln = name != NULL ? g_ascii_strdown(name, -1) : NULL;
+    gchar *ld = desc != NULL ? g_ascii_strdown(desc, -1) : NULL;
+    bool m = (ln != NULL && strstr(ln, lw) != NULL) ||
+             (ld != NULL && strstr(ld, lw) != NULL);
+    g_free(lw);
+    g_free(ln);
+    g_free(ld);
+    return m;
+}
 
-    if (g_pw_stream != NULL || !spa_streq(type, PW_TYPE_INTERFACE_Node))
-        return;
-    const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
-    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
-    if (media_class == NULL || name == NULL)
-        return;
-    if (strncmp(media_class, "Audio/Source", strlen("Audio/Source")) != 0)
-        return;
-
-    syslog(LOG_INFO, "capturing from %s node '%s' (id %u)", media_class, name,
-           id);
-
+/* Create and connect the capture stream to the given node. Must be called with
+ * the PipeWire thread loop locked. */
+static bool bind_capture_source(uint32_t id, const char *name) {
     struct pw_properties *stream_props =
         g_pw.properties_new(PW_KEY_MEDIA_TYPE, "Audio",
                             PW_KEY_MEDIA_CATEGORY, "Capture",
@@ -860,7 +866,7 @@ static void on_registry_global(void *data,
     g_pw_stream = g_pw.stream_new(g_pw_core, "whisper-subtitles", stream_props);
     if (g_pw_stream == NULL) {
         syslog(LOG_ERR, "pw_stream_new failed");
-        return;
+        return false;
     }
     g_pw.stream_add_listener(g_pw_stream, &g_pw_stream_listener,
                              &pw_stream_events_impl, NULL);
@@ -884,9 +890,86 @@ static void on_registry_global(void *data,
         syslog(LOG_ERR, "pw_stream_connect failed: %s", strerror(-res));
         g_pw.stream_destroy(g_pw_stream);
         g_pw_stream = NULL;
-        return;
+        return false;
     }
     g_pw_node_id = id;
+    g_capture_bound = true;
+    syslog(LOG_INFO, "capturing from audio source '%s' (id %u)", name, id);
+    return true;
+}
+
+/* Called from the PipeWire loop thread for every global object; attach a
+ * capture stream to a suitable audio source node. Every audio source is
+ * logged so users can see what to select via the AudioInput setting. */
+static void on_registry_global(void *data,
+                               uint32_t id,
+                               uint32_t permissions,
+                               const char *type,
+                               uint32_t version,
+                               const struct spa_dict *props) {
+    (void)data;
+    (void)permissions;
+    (void)version;
+
+    if (g_capture_bound || !spa_streq(type, PW_TYPE_INTERFACE_Node))
+        return;
+    const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (media_class == NULL || name == NULL)
+        return;
+    if (strncmp(media_class, "Audio/Source", strlen("Audio/Source")) != 0)
+        return;
+    const char *desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+
+    bool is_dummy = g_ascii_strcasecmp(name, "dummy-source") == 0 ||
+                    strstr(name, "dummy") != NULL;
+    syslog(LOG_INFO, "audio source available: id %u name '%s' desc '%s'%s", id,
+           name, desc != NULL ? desc : "", is_dummy ? " (fallback)" : "");
+
+    if (g_audio_input[0] != '\0') {
+        /* Bind only the input the user selected. */
+        if (source_matches(name, desc, g_audio_input))
+            bind_capture_source(id, name);
+        return;
+    }
+    if (!is_dummy) {
+        bind_capture_source(id, name);
+        return;
+    }
+    /* Remember the dummy as a last resort if no real source appears. */
+    if (g_fallback_id == SPA_ID_INVALID) {
+        g_fallback_id = id;
+        g_strlcpy(g_fallback_name, name, sizeof(g_fallback_name));
+    }
+}
+
+/* After enumeration settles, bind a fallback source if a real one was not
+ * found, so devices that only expose a dummy node still behave as before. */
+static gboolean bind_fallback_cb(gpointer user) {
+    (void)user;
+    g_fallback_timer_id = 0;
+    if (g_pw_loop == NULL || g_capture_bound)
+        return G_SOURCE_REMOVE;
+    g_pw.thread_loop_lock(g_pw_loop);
+    if (!g_capture_bound) {
+        if (g_fallback_id != SPA_ID_INVALID) {
+            syslog(LOG_WARNING,
+                   "no dedicated microphone source found; using fallback '%s'. "
+                   "If captions never appear, this device may expose its mic "
+                   "only via VAPIX audio - set RemoteAudioHost to 127.0.0.1.",
+                   g_fallback_name);
+            bind_capture_source(g_fallback_id, g_fallback_name);
+        } else if (g_audio_input[0] != '\0') {
+            syslog(LOG_WARNING,
+                   "selected audio input '%s' not found; see the 'audio source "
+                   "available' log lines for valid names",
+                   g_audio_input);
+        } else {
+            syslog(LOG_WARNING, "no audio source found");
+        }
+    }
+    g_pw.thread_loop_unlock(g_pw_loop);
+    return G_SOURCE_REMOVE;
 }
 
 static void on_registry_global_remove(void *data, uint32_t id) {
@@ -897,6 +980,8 @@ static void on_registry_global_remove(void *data, uint32_t id) {
         g_pw.stream_destroy(g_pw_stream);
         g_pw_stream = NULL;
         g_pw_node_id = SPA_ID_INVALID;
+        g_capture_bound = false;
+        g_fallback_id = SPA_ID_INVALID;
     }
 }
 
@@ -936,10 +1021,18 @@ static bool start_audio(void) {
                         "camera and the app user in the 'pipewire' group?");
         return false;
     }
+
+    /* Give the registry a moment to enumerate, then bind a fallback source if
+     * no real microphone was found. */
+    g_fallback_timer_id = g_timeout_add(2000, bind_fallback_cb, NULL);
     return true;
 }
 
 static void stop_audio(void) {
+    if (g_fallback_timer_id != 0) {
+        g_source_remove(g_fallback_timer_id);
+        g_fallback_timer_id = 0;
+    }
     if (g_pw_loop == NULL)
         return;
     g_pw.thread_loop_lock(g_pw_loop);
@@ -1849,7 +1942,7 @@ static const struct setting_def SETTINGS[] = {
     {"MqttPass", ""},                  {"MqttTopic", "whisper/subtitles"},
     {"MqttClientId", ""},              {"MqttPublishPartials", "no"},
     {"RemoteAudioHost", ""},           {"RemoteAudioUser", ""},
-    {"RemoteAudioPass", ""},
+    {"RemoteAudioPass", ""},           {"AudioInput", ""},
 };
 
 static const char *g_setting_names[G_N_ELEMENTS(SETTINGS)];
@@ -1980,6 +2073,12 @@ int main(void) {
     remote_user = setting_read(params, "RemoteAudioUser");
     remote_pass = setting_read(params, "RemoteAudioPass");
     model_url = setting_read(params, "ModelUrl");
+
+    gchar *audio_input = setting_read(params, "AudioInput");
+    if (audio_input != NULL) {
+        g_strlcpy(g_audio_input, audio_input, sizeof(g_audio_input));
+        g_free(audio_input);
+    }
 
     gchar *v;
     if ((v = setting_read(params, "ApiEnabled")) != NULL) {

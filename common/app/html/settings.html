@@ -158,6 +158,12 @@
     <div class="card">
       <h2>Remote audio (optional)</h2>
       <div class="row">
+        <label>Local audio input
+          <span class="hint">Which built-in mic to use, for devices with more than one. Leave empty to auto-select. Enter part of the input name shown in the App log (lines like “audio source available: … name ‘…’”). Restart to apply.</span>
+        </label>
+        <input type="text" id="AudioInput" placeholder="auto" autocomplete="off">
+      </div>
+      <div class="row">
         <label>Source host
           <span class="hint">Axis device to pull audio from (VAPIX). Empty = this camera's own mic.</span>
         </label>
@@ -341,7 +347,7 @@
     "MaxGain", "StreamStepMs", "ApiEnabled", "MqttEnabled", "MqttHost",
     "MqttPort", "MqttTls", "MqttTlsVerify", "MqttUser", "MqttPass", "MqttTopic",
     "MqttClientId", "MqttPublishPartials",
-    "RemoteAudioHost", "RemoteAudioUser", "RemoteAudioPass"
+    "RemoteAudioHost", "RemoteAudioUser", "RemoteAudioPass", "AudioInput"
   ];
 
   var statusEl = document.getElementById("status");
