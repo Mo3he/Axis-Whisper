@@ -7,12 +7,12 @@ BSD 3-Clause).
 ## whisper.cpp / ggml
 
 - Copyright (c) 2023-2024 The ggml authors
-- Project: https://github.com/ggml-org/whisper.cpp
+- Project: <https://github.com/ggml-org/whisper.cpp>
 - License: MIT
 
 ## Bundled speech model (ggml conversion of OpenAI Whisper)
 
-- Project: https://huggingface.co/ggerganov/whisper.cpp
+- Project: <https://huggingface.co/ggerganov/whisper.cpp>
 - License: MIT (OpenAI Whisper model weights, ggml conversion)
 
 --------------------------------------------------------------------------------
@@ -21,7 +21,7 @@ BSD 3-Clause).
 
 The MIT License applies to whisper.cpp / ggml and the bundled model conversion.
 
-```
+```text
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
