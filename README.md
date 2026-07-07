@@ -104,6 +104,10 @@ If the camera running the app has no microphone, it can pull audio from any
 other Axis device on the network. Set the app parameters (Apps > Whisper
 Subtitles > Settings, or via VAPIX):
 
+On devices without a video pipeline or `axoverlay`, the app now still starts
+and transcribes remote or local audio, but burned-in on-stream subtitles are
+unavailable. In that mode, use the HTTP API and/or MQTT outputs instead.
+
 | Parameter         | Example         | Meaning                                  |
 |-------------------|-----------------|------------------------------------------|
 | `RemoteAudioHost` | `192.168.0.246` | Axis device to pull audio from. Empty = use this camera's own mic. |

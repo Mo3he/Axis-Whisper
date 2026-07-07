@@ -16,6 +16,7 @@
 
 #include <axoverlay.h>
 #include <cairo/cairo.h>
+#include <dlfcn.h>
 #include <glib-unix.h>
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -151,6 +152,23 @@ static gint64 g_subtitle_ts = 0;
 static pthread_mutex_t g_sub_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static gint g_overlay_id = -1;
+static bool g_overlay_available = false;
+
+struct axoverlay_api {
+    void *handle;
+    typeof(axoverlay_redraw) *redraw;
+    typeof(axoverlay_is_backend_supported) *is_backend_supported;
+    typeof(axoverlay_init_axoverlay_settings) *init_settings;
+    typeof(axoverlay_init) *init;
+    typeof(axoverlay_init_overlay_data) *init_overlay_data;
+    typeof(axoverlay_get_max_resolution_width) *get_max_resolution_width;
+    typeof(axoverlay_get_max_resolution_height) *get_max_resolution_height;
+    typeof(axoverlay_create_overlay) *create_overlay;
+    typeof(axoverlay_destroy_overlay) *destroy_overlay;
+    typeof(axoverlay_cleanup) *cleanup;
+};
+
+static struct axoverlay_api g_axoverlay = {0};
 
 /* Optional path to a user-supplied model (downloaded from ModelUrl); when set
  * it is loaded in preference to the bundled ggml-*.bin. */
@@ -440,8 +458,11 @@ static void load_and_watch(AXParameter *params, const char *name) {
 
 static gboolean redraw_idle_cb(gpointer user_data) {
     (void)user_data;
+    if (!g_overlay_available)
+        return G_SOURCE_REMOVE;
+
     GError *error = NULL;
-    axoverlay_redraw(&error);
+    g_axoverlay.redraw(&error);
     if (error != NULL) {
         syslog(LOG_WARNING, "axoverlay_redraw failed: %s", error->message);
         g_error_free(error);
@@ -450,6 +471,8 @@ static gboolean redraw_idle_cb(gpointer user_data) {
 }
 
 static void request_redraw(void) {
+    if (!g_overlay_available)
+        return;
     g_idle_add(redraw_idle_cb, NULL);
 }
 
@@ -1406,29 +1429,107 @@ static gboolean signal_handler_cb(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
+static bool load_overlay_symbol(void **slot, const char *name) {
+    dlerror();
+    *slot = dlsym(g_axoverlay.handle, name);
+    if (*slot != NULL)
+        return true;
+
+    syslog(LOG_WARNING, "missing axoverlay symbol %s: %s", name,
+           dlerror() != NULL ? dlerror() : "unknown");
+    return false;
+}
+
+static void unload_overlay_api(void) {
+    if (g_axoverlay.handle != NULL)
+        dlclose(g_axoverlay.handle);
+    memset(&g_axoverlay, 0, sizeof(g_axoverlay));
+    g_overlay_available = false;
+    g_overlay_id = -1;
+}
+
+static bool load_overlay_api(void) {
+    if (g_axoverlay.handle != NULL)
+        return true;
+
+    g_axoverlay.handle = dlopen("libaxoverlay.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (g_axoverlay.handle == NULL) {
+        syslog(LOG_WARNING, "axoverlay unavailable: %s", dlerror());
+        return false;
+    }
+
+    if (!load_overlay_symbol((void **)&g_axoverlay.redraw,
+                             "axoverlay_redraw") ||
+        !load_overlay_symbol((void **)&g_axoverlay.is_backend_supported,
+                             "axoverlay_is_backend_supported") ||
+        !load_overlay_symbol((void **)&g_axoverlay.init_settings,
+                             "axoverlay_init_axoverlay_settings") ||
+        !load_overlay_symbol((void **)&g_axoverlay.init,
+                             "axoverlay_init") ||
+        !load_overlay_symbol((void **)&g_axoverlay.init_overlay_data,
+                             "axoverlay_init_overlay_data") ||
+        !load_overlay_symbol((void **)&g_axoverlay.get_max_resolution_width,
+                             "axoverlay_get_max_resolution_width") ||
+        !load_overlay_symbol((void **)&g_axoverlay.get_max_resolution_height,
+                             "axoverlay_get_max_resolution_height") ||
+        !load_overlay_symbol((void **)&g_axoverlay.create_overlay,
+                             "axoverlay_create_overlay") ||
+        !load_overlay_symbol((void **)&g_axoverlay.destroy_overlay,
+                             "axoverlay_destroy_overlay") ||
+        !load_overlay_symbol((void **)&g_axoverlay.cleanup,
+                             "axoverlay_cleanup")) {
+        unload_overlay_api();
+        return false;
+    }
+
+    return true;
+}
+
+static void cleanup_overlay(void) {
+    GError *error = NULL;
+
+    if (g_overlay_available && g_overlay_id >= 0)
+        g_axoverlay.destroy_overlay(g_overlay_id, &error);
+    if (error != NULL) {
+        syslog(LOG_WARNING, "axoverlay_destroy_overlay failed: %s",
+               error->message);
+        g_error_free(error);
+    }
+
+    if (g_axoverlay.handle != NULL)
+        g_axoverlay.cleanup();
+    unload_overlay_api();
+}
+
 static bool setup_overlay(void) {
     GError *error = NULL;
 
-    if (!axoverlay_is_backend_supported(AXOVERLAY_CAIRO_IMAGE_BACKEND)) {
-        syslog(LOG_ERR, "cairo overlay backend not supported on this device");
+    if (!load_overlay_api())
+        return false;
+
+    if (!g_axoverlay.is_backend_supported(AXOVERLAY_CAIRO_IMAGE_BACKEND)) {
+        syslog(LOG_WARNING,
+               "cairo overlay backend not supported on this device");
+        cleanup_overlay();
         return false;
     }
 
     struct axoverlay_settings settings;
-    axoverlay_init_axoverlay_settings(&settings);
+    g_axoverlay.init_settings(&settings);
     settings.render_callback = render_overlay_cb;
     settings.adjustment_callback = adjustment_cb;
     settings.select_callback = NULL;
     settings.backend = AXOVERLAY_CAIRO_IMAGE_BACKEND;
-    axoverlay_init(&settings, &error);
+    g_axoverlay.init(&settings, &error);
     if (error != NULL) {
-        syslog(LOG_ERR, "axoverlay_init failed: %s", error->message);
+        syslog(LOG_WARNING, "axoverlay_init failed: %s", error->message);
         g_error_free(error);
+        cleanup_overlay();
         return false;
     }
 
     struct axoverlay_overlay_data data;
-    axoverlay_init_overlay_data(&data);
+    g_axoverlay.init_overlay_data(&data);
     data.postype = AXOVERLAY_CUSTOM_NORMALIZED;
     data.anchor_point = AXOVERLAY_ANCHOR_CENTER;
     data.x = 0.0;
@@ -1437,12 +1538,12 @@ static bool setup_overlay(void) {
     data.colorspace = AXOVERLAY_COLORSPACE_ARGB32;
 
     /* Initial size; the adjustment callback resizes per stream */
-    data.width = axoverlay_get_max_resolution_width(1, &error);
+    data.width = g_axoverlay.get_max_resolution_width(1, &error);
     if (error != NULL) {
         data.width = 1920;
         g_clear_error(&error);
     }
-    data.height = axoverlay_get_max_resolution_height(1, &error);
+    data.height = g_axoverlay.get_max_resolution_height(1, &error);
     if (error != NULL) {
         data.height = 1080;
         g_clear_error(&error);
@@ -1451,12 +1552,16 @@ static bool setup_overlay(void) {
     cfg_snapshot(&cfg0);
     data.height = (gint)(data.height * cfg0.bar_height_frac);
 
-    g_overlay_id = axoverlay_create_overlay(&data, NULL, &error);
+    g_overlay_id = g_axoverlay.create_overlay(&data, NULL, &error);
     if (error != NULL) {
-        syslog(LOG_ERR, "axoverlay_create_overlay failed: %s", error->message);
+        syslog(LOG_WARNING, "axoverlay_create_overlay failed: %s",
+               error->message);
         g_error_free(error);
+        cleanup_overlay();
         return false;
     }
+
+    g_overlay_available = true;
     return true;
 }
 
@@ -1638,12 +1743,9 @@ int main(void) {
         g_clear_error(&perr);
     }
 
-    if (!setup_overlay()) {
-        if (params != NULL)
-            ax_parameter_free(params);
-        g_main_loop_unref(g_loop);
-        return 1;
-    }
+    if (!setup_overlay())
+        syslog(LOG_WARNING,
+               "starting without video subtitles; transcription outputs remain available");
 
     /* Audio source: RemoteAudioHost set -> pull from another Axis device
      * (VAPIX receive.cgi); empty -> capture from this camera's own mic
@@ -1662,7 +1764,7 @@ int main(void) {
     if (!audio_ok) {
         if (params != NULL)
             ax_parameter_free(params);
-        axoverlay_cleanup();
+        cleanup_overlay();
         g_main_loop_unref(g_loop);
         return 1;
     }
@@ -1695,11 +1797,7 @@ int main(void) {
     pthread_join(transcribe_tid, NULL);
     curl_global_cleanup();
 
-    GError *error = NULL;
-    if (g_overlay_id >= 0)
-        axoverlay_destroy_overlay(g_overlay_id, &error);
-    g_clear_error(&error);
-    axoverlay_cleanup();
+    cleanup_overlay();
     if (params != NULL)
         ax_parameter_free(params);
     g_free(g_model_path_override);
