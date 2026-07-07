@@ -702,6 +702,7 @@ static char g_audio_input[128] = "";  /* user selection substring; "" = auto */
 static bool g_capture_bound = false;
 static uint32_t g_fallback_id = SPA_ID_INVALID;
 static char g_fallback_name[256] = "";
+static int g_fallback_rank = 0;
 static guint g_fallback_timer_id = 0;
 
 /* PipeWire is only used for LOCAL microphone capture. On devices without a
@@ -856,6 +857,22 @@ static bool source_matches(const char *name, const char *desc,
     return m;
 }
 
+/* Desirability of an audio source: 3 = a fully processed microphone (with the
+ * device's gain/AGC, best for speech), 2 = the raw '.Unprocessed' node (often
+ * too quiet), 1 = the silent 'dummy-source' fallback. Higher is better. */
+static int source_rank(const char *name) {
+    gchar *l = g_ascii_strdown(name, -1);
+    int rank;
+    if (strstr(l, "dummy") != NULL)
+        rank = 1;
+    else if (strstr(l, "unprocessed") != NULL)
+        rank = 2;
+    else
+        rank = 3;
+    g_free(l);
+    return rank;
+}
+
 /* Create and connect the capture stream to the given node. Must be called with
  * the PipeWire thread loop locked. */
 static bool bind_capture_source(uint32_t id, const char *name) {
@@ -921,10 +938,11 @@ static void on_registry_global(void *data,
         return;
     const char *desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
 
-    bool is_dummy = g_ascii_strcasecmp(name, "dummy-source") == 0 ||
-                    strstr(name, "dummy") != NULL;
+    int rank = source_rank(name);
+    const char *tag =
+        rank == 1 ? " (dummy fallback)" : rank == 2 ? " (unprocessed)" : "";
     syslog(LOG_INFO, "audio source available: id %u name '%s' desc '%s'%s", id,
-           name, desc != NULL ? desc : "", is_dummy ? " (fallback)" : "");
+           name, desc != NULL ? desc : "", tag);
 
     if (g_audio_input[0] != '\0') {
         /* Bind only the input the user selected. */
@@ -932,12 +950,15 @@ static void on_registry_global(void *data,
             bind_capture_source(id, name);
         return;
     }
-    if (!is_dummy) {
+    /* Prefer a fully processed microphone and bind it immediately. Deprioritise
+     * the raw '.Unprocessed' node and the silent dummy, remembering the best of
+     * them in case no processed source appears. */
+    if (rank >= 3) {
         bind_capture_source(id, name);
         return;
     }
-    /* Remember the dummy as a last resort if no real source appears. */
-    if (g_fallback_id == SPA_ID_INVALID) {
+    if (rank > g_fallback_rank) {
+        g_fallback_rank = rank;
         g_fallback_id = id;
         g_strlcpy(g_fallback_name, name, sizeof(g_fallback_name));
     }
@@ -954,9 +975,9 @@ static gboolean bind_fallback_cb(gpointer user) {
     if (!g_capture_bound) {
         if (g_fallback_id != SPA_ID_INVALID) {
             syslog(LOG_WARNING,
-                   "no dedicated microphone source found; using fallback '%s'. "
-                   "If captions never appear, this device may expose its mic "
-                   "only via VAPIX audio - set RemoteAudioHost to 127.0.0.1.",
+                   "no fully processed microphone found; using '%s'. If "
+                   "captions never appear it may be too quiet - check that the "
+                   "microphone is enabled and raise its input gain.",
                    g_fallback_name);
             bind_capture_source(g_fallback_id, g_fallback_name);
         } else if (g_audio_input[0] != '\0') {
@@ -982,6 +1003,7 @@ static void on_registry_global_remove(void *data, uint32_t id) {
         g_pw_node_id = SPA_ID_INVALID;
         g_capture_bound = false;
         g_fallback_id = SPA_ID_INVALID;
+        g_fallback_rank = 0;
     }
 }
 

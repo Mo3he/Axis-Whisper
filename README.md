@@ -33,10 +33,11 @@ publishes to the HTTP API and MQTT. On-screen subtitles are only shown where the
 device has a video overlay; on other devices the app starts, stays running and
 serves its Settings page so you can point it at a remote audio source.
 
-On devices with more than one microphone the input is auto-selected (the app
-skips the silent internal fallback source and picks the real mic). To force a
-specific input, set **Local audio input** in Settings to part of the input name
-shown in the App log (lines like `audio source available: ... name '...'`).
+On devices with more than one microphone the input is auto-selected: the app
+prefers the fully processed microphone (with the device's gain/AGC) over the raw
+`.Unprocessed` input and the silent internal fallback source. To force a specific
+input, set **Local audio input** in Settings to part of the input name shown in
+the App log (lines like `audio source available: ... name '...'`).
 
 ## Installation
 
