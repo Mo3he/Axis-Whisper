@@ -20,7 +20,7 @@
             "vendor": "Mo3he",
             "vendorId": "5741c1fb91",
             "vendorUrl": "https://github.com/Mo3he/Axis-Whisper",
-            "version": "0.2.9",
+            "version": "0.2.10",
             "architecture": "aarch64",
             "runMode": "never",
             "compatibleOsVersions": [

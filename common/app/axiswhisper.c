@@ -857,18 +857,19 @@ static bool source_matches(const char *name, const char *desc,
     return m;
 }
 
-/* Desirability of an audio source: 3 = a fully processed microphone (with the
- * device's gain/AGC, best for speech), 2 = the raw '.Unprocessed' node (often
- * too quiet), 1 = the silent 'dummy-source' fallback. Higher is better. */
+/* Desirability of an audio source: 3 = the plain, fully processed microphone
+ * (with the device's gain/AGC, best for speech), 2 = a raw variant such as
+ * '.Unprocessed' or '.Uncompressed' (a dotted suffix on the input, often too
+ * quiet), 1 = the silent 'dummy-source' fallback. Higher is better. */
 static int source_rank(const char *name) {
     gchar *l = g_ascii_strdown(name, -1);
     int rank;
     if (strstr(l, "dummy") != NULL)
         rank = 1;
-    else if (strstr(l, "unprocessed") != NULL)
-        rank = 2;
+    else if (strchr(l, '.') != NULL)
+        rank = 2; /* AudioDevice0Input0.Unprocessed / .Uncompressed / ... */
     else
-        rank = 3;
+        rank = 3; /* AudioDevice0Input0 */
     g_free(l);
     return rank;
 }
@@ -940,19 +941,16 @@ static void on_registry_global(void *data,
 
     int rank = source_rank(name);
     const char *tag =
-        rank == 1 ? " (dummy fallback)" : rank == 2 ? " (unprocessed)" : "";
+        rank == 1 ? " (dummy fallback)" : rank == 2 ? " (raw variant)" : "";
     syslog(LOG_INFO, "audio source available: id %u name '%s' desc '%s'%s", id,
            name, desc != NULL ? desc : "", tag);
 
-    if (g_audio_input[0] != '\0') {
-        /* Bind only the input the user selected. */
-        if (source_matches(name, desc, g_audio_input))
-            bind_capture_source(id, name);
+    /* In manual mode (AudioInput set) only the user-selected input is eligible;
+     * in auto mode every source is. Either way the choice is ranked, so the
+     * plain processed mic wins over raw variants and the dummy. */
+    if (g_audio_input[0] != '\0' && !source_matches(name, desc, g_audio_input))
         return;
-    }
-    /* Prefer a fully processed microphone and bind it immediately. Deprioritise
-     * the raw '.Unprocessed' node and the silent dummy, remembering the best of
-     * them in case no processed source appears. */
+
     if (rank >= 3) {
         bind_capture_source(id, name);
         return;
