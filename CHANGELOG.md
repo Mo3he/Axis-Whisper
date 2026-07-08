@@ -5,6 +5,8 @@ links to its full release notes on GitHub.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.11] - 2026-07-08 - Whisper Subtitles 0.2.11
+
 ## [0.2.10] - 2026-07-07 - Whisper Subtitles 0.2.10
 
 ## [0.2.9] - 2026-07-07 - Whisper Subtitles 0.2.9
@@ -23,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.1.11] - 2026-07-03 - Whisper Subtitles 0.1.11
 
+[0.2.11]: https://github.com/Mo3he/Axis-Whisper/releases/tag/v0.2.11
 [0.2.10]: https://github.com/Mo3he/Axis-Whisper/releases/tag/v0.2.10
 [0.2.9]: https://github.com/Mo3he/Axis-Whisper/releases/tag/v0.2.9
 [0.2.8]: https://github.com/Mo3he/Axis-Whisper/releases/tag/v0.2.8
