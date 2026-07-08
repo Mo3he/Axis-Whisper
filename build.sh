@@ -37,7 +37,7 @@ echo '==> Building aarch64 (aarch64/Dockerfile)...'
 # Copy the packaged .eap out of the built image via a throwaway container.
 CID=$("$RUNTIME" create "$TAG")
 TMP=$(mktemp -d)
-"$RUNTIME" cp "${CID}:/opt/app/." "$TMP/" >/dev/null 2>&1 || \
+"$RUNTIME" cp "${CID}:/opt/app/." "$TMP/" >/dev/null 2>&1 ||
 	"$RUNTIME" cp "${CID}:/opt/app" "$TMP/"
 find "$TMP" -name '*.eap' -exec cp {} "${REPO_ROOT}/" \;
 rm -rf "$TMP"

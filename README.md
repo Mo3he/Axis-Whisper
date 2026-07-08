@@ -3,7 +3,7 @@
 Live speech-to-text — running **entirely on the camera**. No cloud services, no external
 server, no network dependencies.
 
-```
+```text
   Camera microphone (PipeWire)        Another Axis device's microphone
         │  16 kHz mono S16              │  VAPIX receive.cgi, G.711 u-law
         └──────────────┬────────────────┘
