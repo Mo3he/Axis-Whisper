@@ -251,7 +251,16 @@ slower; `small` and up are generally too slow for live captioning on-device.
 
 ## Building
 
-Build from the repository root (Docker and Podman both work):
+Whisper is aarch64-only (the ML workload is not practical on 32-bit armv7hf).
+Use the top-level `build.sh` wrapper, which builds the ACAP `.eap` package and
+drops it in the repository root:
+
+```sh
+./build.sh
+```
+
+It auto-detects `docker` or `podman`; override with `RUNTIME=docker`. To build
+manually instead:
 
 ```sh
 # Docker
