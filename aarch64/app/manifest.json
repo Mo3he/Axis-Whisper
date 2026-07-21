@@ -17,8 +17,8 @@
         "setup": {
             "appName": "Whisper_Subtitles",
             "friendlyName": "Whisper Subtitles",
-            "vendor": "Mo3he",
-            "vendorId": "5741c1fb91",
+            "vendor": "moshe@mohome.net",
+            "vendorId": "70ee172dd9",
             "vendorUrl": "https://github.com/Mo3he/Axis-Whisper",
             "version": "0.2.11",
             "architecture": "aarch64",
