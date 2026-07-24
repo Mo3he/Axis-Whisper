@@ -52,6 +52,7 @@ published over an HTTP API and MQTT.
 ## Compatibility
 
 - **AXIS OS:** 12.x through 13.
+- **Verified on AXIS OS 13** (13.0.0, aarch64).
 - **Architecture:** `aarch64` only (ARTPEC-8/9 recommended; Whisper inference is
   too slow to be useful on armv7 devices, so no arm build is provided).
 - **Requires:** a microphone, either built-in or connected to audio-in (with **audio
