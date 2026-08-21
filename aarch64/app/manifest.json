@@ -1,240 +1,242 @@
 {
-    "schemaVersion": "2.0.0",
-    "resources": {
-        "dbus": {
-            "requiredMethods": [
-                "com.axis.Graphics2.*",
-                "com.axis.Overlay2.*"
-            ]
-        },
-        "linux": {
-            "user": {
-                "conditionalGroups": ["pipewire"]
-            }
-        }
+  "schemaVersion": "2.0.0",
+  "resources": {
+    "dbus": {
+      "requiredMethods": [
+        "com.axis.Graphics2.*",
+        "com.axis.Overlay2.*"
+      ]
     },
-    "acapPackageConf": {
-        "setup": {
-            "appName": "Whisper_Subtitles",
-            "friendlyName": "Whisper Subtitles",
-            "vendor": "moshe@mohome.net",
-            "vendorId": "70ee172dd9",
-            "vendorUrl": "https://github.com/Mo3he/Axis-Whisper",
-            "version": "0.2.11",
-            "architecture": "aarch64",
-            "runMode": "respawn",
-            "compatibleOsVersions": [
-                {
-                    "max": "13"
-                }
-            ]
-        },
-        "configuration": {
-            "settingPage": "settings.html",
-            "reverseProxy": [
-                {
-                    "apiPath": "api",
-                    "target": "http://localhost:2721/",
-                    "access": "viewer"
-                },
-                {
-                    "apiPath": "config",
-                    "target": "http://localhost:2722/",
-                    "access": "admin"
-                }
-            ],
-            "paramConfig": [
-                {
-                    "name": "MicSensitivity",
-                    "default": "Normal",
-                    "type": "enum:Low,Normal,High,Maximum"
-                },
-                {
-                    "name": "SilenceTimeoutMs",
-                    "default": "800",
-                    "type": "int"
-                },
-                {
-                    "name": "MinSpeechMs",
-                    "default": "300",
-                    "type": "int"
-                },
-                {
-                    "name": "MaxUtteranceSec",
-                    "default": "6",
-                    "type": "int"
-                },
-                {
-                    "name": "SubtitleDurationSec",
-                    "default": "6",
-                    "type": "int"
-                },
-                {
-                    "name": "FontScale",
-                    "default": "Medium",
-                    "type": "enum:Small,Medium,Large"
-                },
-                {
-                    "name": "SubtitlePosition",
-                    "default": "Bottom",
-                    "type": "enum:Bottom,Top"
-                },
-                {
-                    "name": "StreamingCaptions",
-                    "default": "yes",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "RemoteAudioHost",
-                    "default": "",
-                    "type": "string"
-                },
-                {
-                    "name": "RemoteAudioUser",
-                    "default": "",
-                    "type": "string"
-                },
-                {
-                    "name": "RemoteAudioPass",
-                    "default": "",
-                    "type": "password"
-                },
-                {
-                    "name": "AudioInput",
-                    "default": "",
-                    "type": "string"
-                },
-                {
-                    "name": "SubtitlesEnabled",
-                    "default": "yes",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "MaxLines",
-                    "default": "2",
-                    "type": "int"
-                },
-                {
-                    "name": "BarHeightPct",
-                    "default": "20",
-                    "type": "int"
-                },
-                {
-                    "name": "BackgroundOpacity",
-                    "default": "55",
-                    "type": "int"
-                },
-                {
-                    "name": "TextColor",
-                    "default": "#FFFFFF",
-                    "type": "string"
-                },
-                {
-                    "name": "InferenceThreads",
-                    "default": "3",
-                    "type": "int"
-                },
-                {
-                    "name": "Language",
-                    "default": "en",
-                    "type": "string"
-                },
-                {
-                    "name": "Translate",
-                    "default": "no",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "MaxTokens",
-                    "default": "64",
-                    "type": "int"
-                },
-                {
-                    "name": "TemperatureFallback",
-                    "default": "no",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "NoiseGuardMargin",
-                    "default": "8.0",
-                    "type": "string"
-                },
-                {
-                    "name": "MinSignalPeak",
-                    "default": "0.02",
-                    "type": "string"
-                },
-                {
-                    "name": "MaxGain",
-                    "default": "4.0",
-                    "type": "string"
-                },
-                {
-                    "name": "StreamStepMs",
-                    "default": "900",
-                    "type": "int"
-                },
-                {
-                    "name": "ModelUrl",
-                    "default": "",
-                    "type": "string"
-                },
-                {
-                    "name": "ApiEnabled",
-                    "default": "yes",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "MqttEnabled",
-                    "default": "no",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "MqttHost",
-                    "default": "",
-                    "type": "string"
-                },
-                {
-                    "name": "MqttPort",
-                    "default": "1883",
-                    "type": "int"
-                },
-                {
-                    "name": "MqttTls",
-                    "default": "no",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "MqttTlsVerify",
-                    "default": "no",
-                    "type": "bool:no,yes"
-                },
-                {
-                    "name": "MqttUser",
-                    "default": "",
-                    "type": "string"
-                },
-                {
-                    "name": "MqttPass",
-                    "default": "",
-                    "type": "password"
-                },
-                {
-                    "name": "MqttTopic",
-                    "default": "whisper/subtitles",
-                    "type": "string"
-                },
-                {
-                    "name": "MqttClientId",
-                    "default": "",
-                    "type": "string"
-                },
-                {
-                    "name": "MqttPublishPartials",
-                    "default": "no",
-                    "type": "bool:no,yes"
-                }
-            ]
-        }
+    "linux": {
+      "user": {
+        "conditionalGroups": [
+          "pipewire"
+        ]
+      }
     }
+  },
+  "acapPackageConf": {
+    "setup": {
+      "appName": "Whisper_Subtitles",
+      "friendlyName": "Whisper Subtitles",
+      "vendor": "moshe@mohome.net",
+      "vendorId": "70ee172dd9",
+      "vendorUrl": "https://github.com/Mo3he/Axis-Whisper",
+      "version": "1.9.3",
+      "architecture": "aarch64",
+      "runMode": "respawn",
+      "compatibleOsVersions": [
+        {
+          "max": "13"
+        }
+      ]
+    },
+    "configuration": {
+      "settingPage": "settings.html",
+      "reverseProxy": [
+        {
+          "apiPath": "api",
+          "target": "http://localhost:2721/",
+          "access": "viewer"
+        },
+        {
+          "apiPath": "config",
+          "target": "http://localhost:2722/",
+          "access": "admin"
+        }
+      ],
+      "paramConfig": [
+        {
+          "name": "MicSensitivity",
+          "default": "Normal",
+          "type": "enum:Low,Normal,High,Maximum"
+        },
+        {
+          "name": "SilenceTimeoutMs",
+          "default": "800",
+          "type": "int"
+        },
+        {
+          "name": "MinSpeechMs",
+          "default": "300",
+          "type": "int"
+        },
+        {
+          "name": "MaxUtteranceSec",
+          "default": "6",
+          "type": "int"
+        },
+        {
+          "name": "SubtitleDurationSec",
+          "default": "6",
+          "type": "int"
+        },
+        {
+          "name": "FontScale",
+          "default": "Medium",
+          "type": "enum:Small,Medium,Large"
+        },
+        {
+          "name": "SubtitlePosition",
+          "default": "Bottom",
+          "type": "enum:Bottom,Top"
+        },
+        {
+          "name": "StreamingCaptions",
+          "default": "yes",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "RemoteAudioHost",
+          "default": "",
+          "type": "string"
+        },
+        {
+          "name": "RemoteAudioUser",
+          "default": "",
+          "type": "string"
+        },
+        {
+          "name": "RemoteAudioPass",
+          "default": "",
+          "type": "password"
+        },
+        {
+          "name": "AudioInput",
+          "default": "",
+          "type": "string"
+        },
+        {
+          "name": "SubtitlesEnabled",
+          "default": "yes",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "MaxLines",
+          "default": "2",
+          "type": "int"
+        },
+        {
+          "name": "BarHeightPct",
+          "default": "20",
+          "type": "int"
+        },
+        {
+          "name": "BackgroundOpacity",
+          "default": "55",
+          "type": "int"
+        },
+        {
+          "name": "TextColor",
+          "default": "#FFFFFF",
+          "type": "string"
+        },
+        {
+          "name": "InferenceThreads",
+          "default": "3",
+          "type": "int"
+        },
+        {
+          "name": "Language",
+          "default": "en",
+          "type": "string"
+        },
+        {
+          "name": "Translate",
+          "default": "no",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "MaxTokens",
+          "default": "64",
+          "type": "int"
+        },
+        {
+          "name": "TemperatureFallback",
+          "default": "no",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "NoiseGuardMargin",
+          "default": "8.0",
+          "type": "string"
+        },
+        {
+          "name": "MinSignalPeak",
+          "default": "0.02",
+          "type": "string"
+        },
+        {
+          "name": "MaxGain",
+          "default": "4.0",
+          "type": "string"
+        },
+        {
+          "name": "StreamStepMs",
+          "default": "900",
+          "type": "int"
+        },
+        {
+          "name": "ModelUrl",
+          "default": "",
+          "type": "string"
+        },
+        {
+          "name": "ApiEnabled",
+          "default": "yes",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "MqttEnabled",
+          "default": "no",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "MqttHost",
+          "default": "",
+          "type": "string"
+        },
+        {
+          "name": "MqttPort",
+          "default": "1883",
+          "type": "int"
+        },
+        {
+          "name": "MqttTls",
+          "default": "no",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "MqttTlsVerify",
+          "default": "no",
+          "type": "bool:no,yes"
+        },
+        {
+          "name": "MqttUser",
+          "default": "",
+          "type": "string"
+        },
+        {
+          "name": "MqttPass",
+          "default": "",
+          "type": "password"
+        },
+        {
+          "name": "MqttTopic",
+          "default": "whisper/subtitles",
+          "type": "string"
+        },
+        {
+          "name": "MqttClientId",
+          "default": "",
+          "type": "string"
+        },
+        {
+          "name": "MqttPublishPartials",
+          "default": "no",
+          "type": "bool:no,yes"
+        }
+      ]
+    }
+  }
 }

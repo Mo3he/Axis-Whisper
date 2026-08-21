@@ -5,6 +5,10 @@ links to its full release notes on GitHub.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## 1.9.3 - 2026-08-21
+
+- Update to upstream 1.9.3.
+
 ## [0.2.11-Signed] - 2026-07-21 - Whisper Subtitles 0.2.11 (Signed)
 
 - Packages are now signed with the Axis ACAP signing service and install
