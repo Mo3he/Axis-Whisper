@@ -1,0 +1,31 @@
+{
+  "app": "Whisper_Subtitles",
+  "friendlyName": "Whisper Subtitles",
+  "versionPolicy": "mirror",
+  "upstream": {
+    "type": "github-tag",
+    "repo": "ggml-org/whisper.cpp",
+    "tagPattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$",
+    "strip": "v",
+    "note": "whisper.cpp releases are bNNNN build tags; track only semver tags.",
+    "name": "whisper.cpp",
+    "changesUrl": "https://github.com/ggml-org/whisper.cpp/releases/tag/v${UPSTREAM}"
+  },
+  "build": {
+    "command": "./build.sh",
+    "env": {}
+  },
+  "pins": [
+    {
+      "file": "aarch64/Dockerfile",
+      "arg": "WHISPER_VERSION",
+      "prefix": "v"
+    }
+  ],
+  "signing": {
+    "skip": [
+      "*_acap3.eap",
+      "*_root.eap"
+    ]
+  }
+}

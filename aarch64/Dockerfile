@@ -12,7 +12,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
     rm -rf /var/lib/apt/lists/*
 
 # --- whisper.cpp: static CPU-only libs cross-compiled with the SDK toolchain
-ARG WHISPER_VERSION=v1.7.5
+ARG WHISPER_VERSION=v1.9.3
 WORKDIR /opt/build
 RUN git clone --depth 1 --branch ${WHISPER_VERSION} \
         https://github.com/ggml-org/whisper.cpp.git
