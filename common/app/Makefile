@@ -18,10 +18,18 @@ LDADD  = $(shell pkg-config --libs $(PKGS))
 LDADD += -Lwhisper/lib -lwhisper -lggml -lggml-cpu -lggml-base
 LDADD += -lstdc++ -lm -pthread -ldl
 
+# The static whisper.cpp/ggml C++ libs contribute ~14 MB of symbols (89% of the
+# binary). Keep the unstripped copy outside the app dir so acap-build cannot
+# package it, but crashes can still be symbolised with addr2line.
+STRIP ?= strip
+DEBUGDIR ?= /opt/debug
+
 all: $(PROG)
 
 $(PROG): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDADD)
+	mkdir -p $(DEBUGDIR) && cp $@ $(DEBUGDIR)/$@.unstripped
+	$(STRIP) $@
 
 clean:
 	rm -f $(PROG) *.eap *_LICENSE.txt

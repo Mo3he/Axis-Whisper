@@ -30,6 +30,7 @@ TAG="whisper-acap-build-$$"
 
 echo '==> Cleaning old .eap files...'
 rm -f "${REPO_ROOT}"/*.eap
+rm -rf "${REPO_ROOT}/debug"
 
 echo '==> Building aarch64 (aarch64/Dockerfile)...'
 "$RUNTIME" build -f "${REPO_ROOT}/aarch64/Dockerfile" -t "$TAG" "$REPO_ROOT"
@@ -41,6 +42,10 @@ TMP=$(mktemp -d)
 	"$RUNTIME" cp "${CID}:/opt/app" "$TMP/"
 find "$TMP" -name '*.eap' -exec cp {} "${REPO_ROOT}/" \;
 rm -rf "$TMP"
+# Unstripped binary for symbolising crash dumps; never shipped.
+mkdir -p "${REPO_ROOT}/debug"
+"$RUNTIME" cp "${CID}:/opt/debug/Whisper_Subtitles.unstripped" \
+	"${REPO_ROOT}/debug/Whisper_Subtitles-aarch64.unstripped"
 "$RUNTIME" rm -f "$CID" >/dev/null 2>&1 || true
 "$RUNTIME" rmi -f "$TAG" >/dev/null 2>&1 || true
 

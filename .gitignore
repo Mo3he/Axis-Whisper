@@ -6,6 +6,9 @@ releases/
 build/
 *.eap
 
+# Unstripped binaries kept for crash symbolisation, uploaded as a CI artifact
+debug/
+
 # Staged build inputs - fetched fresh by the Dockerfile at build time, not stored in git
 common/app/whisper/
 common/app/*.bin
