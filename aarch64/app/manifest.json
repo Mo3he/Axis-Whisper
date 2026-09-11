@@ -22,7 +22,7 @@
       "vendor": "moshe@mohome.net",
       "vendorId": "70ee172dd9",
       "vendorUrl": "https://github.com/Mo3he/Axis-Whisper",
-      "version": "1.9.3",
+      "version": "1.9.4",
       "architecture": "aarch64",
       "runMode": "respawn",
       "compatibleOsVersions": [

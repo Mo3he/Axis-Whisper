@@ -5,6 +5,10 @@ links to its full release notes on GitHub.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## 1.9.4 - 2026-09-11
+
+- Update to upstream 1.9.4.
+
 ## 1.9.3 - 2026-08-21
 
 - Update to upstream 1.9.3.
