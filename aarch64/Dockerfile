@@ -30,11 +30,8 @@ RUN . /opt/axis/acapsdk/environment-setup* && \
     cmake --build build -j"$(nproc)"
 
 # --- Whisper model (bundled into the .eap)
-# Whisper model bundled into the .eap. base.en gives clearly better accuracy
-# than tiny.en on hard content (names, numbers, phonetic alphabet) at ~2x the
-# CPU cost and still streams acceptably on ARTPEC-8/9. Swap to tiny.en for
-# lower latency, or small.en for best accuracy (too slow for live captions).
-# The app auto-detects whichever ggml-*.bin is bundled.
+# base.en beats tiny.en on names/numbers at ~2x CPU and still streams on
+# ARTPEC-8/9; small.en is too slow for live captions. Any ggml-*.bin is detected.
 ARG MODEL=ggml-base.en-q5_1.bin
 RUN mkdir -p /opt/model && \
     curl -fsSL -o /opt/model/${MODEL} \

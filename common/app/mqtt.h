@@ -1,15 +1,8 @@
 /**
- * mqtt - self-contained MQTT publisher for transcriptions.
+ * mqtt - minimal MQTT 3.1.1 publisher (QoS 0, optional TLS) over GLib sockets.
  *
- * A minimal MQTT 3.1.1 client (publish only, QoS 0) implemented directly over
- * GLib's GSocketClient, so no external MQTT library is required. It connects
- * to a user-configured broker (optionally over TLS), keeps the connection
- * open, and publishes each finalized transcription (and optionally live
- * partials) as a JSON message to a configurable topic.
- *
- * Networking runs on a dedicated worker thread; the transcript subscriber
- * callback only enqueues payloads, so the audio/main threads never block on
- * the broker. The connection is re-established automatically on failure.
+ * A worker thread owns the connection and reconnects on failure; the transcript
+ * callback only enqueues JSON payloads, so the main loop never blocks.
  */
 #ifndef MQTT_H
 #define MQTT_H

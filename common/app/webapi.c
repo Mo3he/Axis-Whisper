@@ -20,8 +20,7 @@ static GSocketService *g_service = NULL;
 static GList *g_clients = NULL; /* struct sse_client* */
 static guint g_heartbeat_id = 0;
 
-/* Config (settings) server context. Requests arriving on this local port are
- * exposed through an admin-access reverseProxy route. */
+/* Config (settings) server state; its port is the admin reverseProxy route. */
 static guint16 g_config_port = 0;
 static const char *const *g_setting_names = NULL;
 static guint g_n_settings = 0;
@@ -37,7 +36,6 @@ static gboolean is_secret_name(const char *name) {
     return FALSE;
 }
 
-/* Per-request parsing context. */
 struct req_ctx {
     GSocketConnection *conn;
     GDataInputStream *din;

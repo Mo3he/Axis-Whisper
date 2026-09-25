@@ -123,9 +123,8 @@ static GSocketConnection *connect_broker(void) {
     g_socket_client_set_timeout(client, 10);
     if (g_cfg.tls) {
         g_socket_client_set_tls(client, TRUE);
-        /* By default accept broker certificates that don't chain to a system
-         * CA (self-signed brokers are common on local networks). Set
-         * MqttTlsVerify to require a valid certificate chain instead. */
+        /* Accept self-signed brokers by default (common on LANs); MqttTlsVerify
+         * requires a valid certificate chain. */
         if (!g_cfg.tls_verify)
             g_socket_client_set_tls_validation_flags(client, 0);
     }
@@ -198,9 +197,8 @@ static void on_transcript(const char *text,
     g_string_append_printf(p, "\",\"timestampMs\":%" G_GINT64_FORMAT
                               ",\"final\":%s}",
                            ts_ms, is_final ? "true" : "false");
-    /* Parenthesize to bypass the GLib 2.76+ macro that would emit a
-     * reference to g_string_free_and_steal, which is absent on older
-     * firmware GLib. Call the real function so we stay backward compatible. */
+    /* Parenthesized to bypass the GLib 2.76+ macro that references
+     * g_string_free_and_steal, which older firmware GLib lacks. */
     g_async_queue_push(g_queue, (g_string_free)(p, FALSE));
 }
 
@@ -240,7 +238,6 @@ void mqtt_stop(void) {
     pthread_join(g_tid, NULL);
     g_started = FALSE;
 
-    /* Drain any leftover payloads. */
     gpointer msg;
     while ((msg = g_async_queue_try_pop(g_queue)) != NULL)
         if (msg != &g_sentinel)

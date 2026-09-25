@@ -1,17 +1,10 @@
 /**
  * axiswhisper - on-camera speech-to-text subtitles for Axis cameras
  *
- * Pipeline (all on-device, no external dependencies):
- *
- *   PipeWire capture (16 kHz mono S16)
- *     -> whisper.cpp (tiny.en quantized, CPU inference)
- *       -> axoverlay/Cairo subtitle bar burned into all video streams
- *
- * Three threads:
- *   - main:        GLib main loop servicing axoverlay render callbacks
- *   - pipewire:    capture stream feeding a ring buffer
- *   - transcribe:  consumes fixed-size chunks from the ring, runs whisper,
- *                  posts subtitle text and schedules an overlay redraw
+ * Local PipeWire mic or remote VAPIX audio (16 kHz mono S16) -> ring buffer
+ *   -> whisper.cpp (bundled ggml model, CPU) -> axoverlay bar, HTTP API, MQTT.
+ * Capture and transcription run on worker threads; the GLib main loop drives
+ * the overlay.
  */
 
 #include <axoverlay.h>
@@ -58,15 +51,8 @@
 
 #define SAMPLE_RATE 16000
 
-/* Speech segmentation: audio is chopped into utterances by a simple
- * energy VAD with an adaptive noise floor. An utterance starts when a
- * 100 ms frame rises above the gate (with PREROLL_FRAMES of context
- * prepended), and ends after hang_frames of silence or max_utter_seconds.
- *
- * The gate, silence timeout, minimum speech length, maximum utterance
- * length and on-screen subtitle duration are all runtime-tunable from the
- * application's Settings web page (see the manifest paramConfig and the
- * runtime configuration section below). The values here are only defaults. */
+/* Energy VAD with an adaptive noise floor splits audio into utterances. The
+ * values below are only defaults; most are tunable from the Settings page. */
 #define FRAME_MS 100
 #define FRAME_SAMPLES (SAMPLE_RATE * FRAME_MS / 1000)
 #define PREROLL_FRAMES 3     /* 300 ms of audio kept before speech onset */
@@ -76,8 +62,7 @@
 #define DEFAULT_MAX_UTTER_SECONDS 6
 #define MAX_UTTER_SECONDS_CAP 15   /* hard cap; sizes the utterance buffer */
 
-/* Ring buffer capacity. If whisper falls behind by more than this, the
- * oldest audio is dropped so subtitles stay (roughly) live. */
+/* If whisper falls this far behind, the backlog is dropped to stay live. */
 #define RING_SECONDS 32
 #define RING_SAMPLES (SAMPLE_RATE * RING_SECONDS)
 
@@ -90,53 +75,34 @@
 #define NOISE_FLOOR_MIN 0.0005f
 #define NOISE_FLOOR_MAX 0.02f
 
-/* An utterance whose peak amplitude never rises above this is treated as
- * noise/near-silence and not transcribed. Kept low so genuinely quiet but
- * real speech from a good microphone is still transcribed; the upstream VAD
- * gate is the primary speech/noise decision. */
+/* Utterances peaking below this are skipped as noise. Kept low so quiet real
+ * speech still passes; the VAD gate is the primary speech/noise decision. */
 #define SIGNAL_PEAK_MIN 0.02f
 
-/* Adaptive noise guard: an utterance is only transcribed if its peak clears
- * the adaptive room noise floor by this margin (or SIGNAL_PEAK_MIN, whichever
- * is higher). In a quiet room the floor is tiny, so quiet speech passes; in a
- * noisy room (e.g. constant background chatter on a CCTV install) the floor
- * rises, so only clear foreground speech is transcribed. This keeps whisper
- * from running - and hallucinating - on background noise, which also prevents
- * the transcriber falling behind and dropping audio. */
+/* Transcribe only if the peak clears noise_floor * margin (or the peak floor).
+ * Keeps whisper from hallucinating on CCTV chatter and falling behind on it. */
 #define SIGNAL_SNR_MARGIN 8.0f
 
-/* Default subtitle on-screen duration after the last transcription. */
 #define DEFAULT_SUBTITLE_TTL_SEC 6
 
-/* Streaming captions: while speech continues, re-transcribe the utterance so
- * far every STREAM_STEP_MS and update the on-screen text, so captions build
- * up live as the person speaks instead of only appearing once the phrase
- * ends. Sized small so updates feel live; the dynamic encoder context keeps
- * each partial pass cheap. */
+/* Re-transcribe the growing utterance this often so captions build up live;
+ * the dynamic encoder context keeps each partial pass cheap. */
 #define STREAM_STEP_MS 900
 #define STREAM_STEP_SAMPLES (SAMPLE_RATE * STREAM_STEP_MS / 1000)
 
-/* Streaming partials re-transcribe the growing utterance and multiply CPU
- * cost. Under continuous speech (a busy CCTV scene with people talking in the
- * background) that makes the single transcription thread fall behind realtime
- * and drop audio. So partials are only emitted while the reader is keeping up:
- * if it has fallen more than this far behind the capture head, partials are
- * skipped and only the final (one pass per utterance) is produced, letting the
- * backlog drain. */
+/* Partials multiply CPU cost; skip them when the reader lags this far behind
+ * capture so the single transcription thread can drain the backlog. */
 #define STREAM_MAX_BACKLOG_SAMPLES (SAMPLE_RATE * 2) /* ~2 s */
 
 #define SUBTITLE_MAX 512
-/* Maximum caption lines the renderer can lay out. The number actually shown
- * is runtime-tunable (cfg.max_lines) up to this compile-time cap. */
+/* Compile-time cap; cfg.max_lines selects how many lines are shown. */
 #define MAX_LINES 3
 
-/* Localhost port for the transcription HTTP API. Must match the reverseProxy
- * target in manifest.json. */
+/* Must match the viewer reverseProxy target in manifest.json. */
 #define API_PORT 2721
 
-/* Localhost port for the settings config endpoint (admin reverseProxy route).
- * Kept separate from API_PORT so the device can enforce admin access on
- * settings writes while the transcription API stays viewer-accessible. */
+/* Separate admin-only reverseProxy port, so settings writes require admin
+ * while the transcription API stays viewer-accessible. */
 #define CONFIG_PORT 2722
 
 /* ------------------------------------------------------------------ */
@@ -152,7 +118,6 @@ static uint64_t g_written = 0; /* total samples ever written */
 static pthread_mutex_t g_ring_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_ring_cond = PTHREAD_COND_INITIALIZER;
 
-/* Current subtitle */
 static char g_subtitle[SUBTITLE_MAX] = "";
 static gint64 g_subtitle_ts = 0;
 static pthread_mutex_t g_sub_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -176,9 +141,8 @@ struct axoverlay_api {
 
 static struct axoverlay_api g_axoverlay = {0};
 
-/* Cairo is only used from the overlay render callback, so like axoverlay it is
- * loaded at runtime and treated as optional: on devices without the video /
- * overlay stack neither library is present, and the app still transcribes. */
+/* Loaded at runtime like axoverlay: devices without the overlay stack lack
+ * both libraries and the app still transcribes. */
 struct cairo_api {
     void *handle;
     typeof(cairo_set_operator) *set_operator;
@@ -200,13 +164,7 @@ static struct cairo_api g_cairo = {0};
 static gchar *g_model_path_override = NULL;
 
 /* ------------------------------------------------------------------ */
-/* Runtime configuration                                               */
-/*                                                                     */
-/* These values are tunable at runtime from the application's Settings  */
-/* web page (Apps > Whisper Subtitles > Settings) or via VAPIX          */
-/* param.cgi. Changes are applied live through axparameter callbacks    */
-/* (param_changed_cb), except SubtitlePosition which is read once at     */
-/* startup. Readers take a lock-free snapshot with cfg_snapshot().      */
+/* Runtime configuration (live-tunable; read via cfg_snapshot())       */
 /* ------------------------------------------------------------------ */
 
 struct config {
@@ -219,8 +177,7 @@ struct config {
     double font_scale;     /* subtitle font size multiplier */
     bool streaming;        /* emit live partial captions during speech */
 
-    /* On-screen subtitles. When disabled, transcription still runs and is
-     * published to the HTTP API and MQTT, but nothing is burned into video. */
+    /* When false, transcripts still reach the API and MQTT, just not video. */
     bool subtitles_enabled;
     int max_lines;         /* caption lines shown (1..MAX_LINES) */
     double bar_height_frac;/* subtitle bar height as fraction of frame */
@@ -228,7 +185,7 @@ struct config {
     double text_r, text_g, text_b; /* subtitle text colour (0..1) */
 
     /* Whisper decode parameters. */
-    int n_threads;         /* inference threads */
+    int n_threads;
     int max_tokens;        /* max decoded tokens per segment */
     bool translate;        /* translate to English (multilingual models) */
     bool temp_fallback;    /* enable temperature fallback re-decode */
@@ -269,8 +226,7 @@ static struct config g_cfg = {
 };
 static pthread_mutex_t g_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Read once at startup: place the subtitle bar near the top of the frame
- * instead of the bottom. Changing it takes effect after an app restart. */
+/* Only read when the overlay is created, so changes need an app restart. */
 static bool g_subtitle_top = false;
 
 static void cfg_snapshot(struct config *out) {
@@ -293,12 +249,9 @@ static bool parse_bool(const char *value) {
            g_ascii_strcasecmp(value, "on") == 0 || g_strcmp0(value, "1") == 0;
 }
 
-/* Redraw request; defined with the overlay code further down. */
 static void request_redraw(void);
 
-/* Map the Settings web page values onto the config struct. Called both at
- * startup (for every parameter) and from the change callback. Unknown
- * parameter names are ignored. */
+/* Apply one setting to g_cfg; unknown names are ignored. */
 static void cfg_apply(const char *name, const char *value) {
     if (name == NULL || value == NULL)
         return;
@@ -501,7 +454,7 @@ static void request_redraw(void) {
     g_idle_add(redraw_idle_cb, NULL);
 }
 
-/* Greedy word wrap using cairo text metrics. Keeps the LAST MAX_LINES
+/* Greedy word wrap using cairo text metrics. Keeps the LAST max_lines
  * lines when the text overflows, which reads naturally for live captions. */
 static int wrap_text(cairo_t *cr,
                      const char *text,
@@ -564,7 +517,6 @@ static void render_overlay_cb(gpointer render_context,
     (void)user_data;
     cairo_t *cr = (cairo_t *)render_context;
 
-    /* Clear to fully transparent */
     g_cairo.set_operator(cr, CAIRO_OPERATOR_SOURCE);
     g_cairo.set_source_rgba(cr, 0, 0, 0, 0);
     g_cairo.paint(cr);
@@ -580,7 +532,7 @@ static void render_overlay_cb(gpointer render_context,
     struct config cfg;
     cfg_snapshot(&cfg);
     if (!cfg.subtitles_enabled)
-        return; /* transcription still runs; nothing is burned into video */
+        return;
 
     double font_size = overlay_height / 3.2 * cfg.font_scale;
     g_cairo.select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL,
@@ -602,13 +554,11 @@ static void render_overlay_cb(gpointer render_context,
         double tx = (overlay_width - ext.width) / 2.0;
         double baseline = block_top + line_h * i + font_size;
 
-        /* Semi-transparent backing box */
         g_cairo.set_source_rgba(cr, 0, 0, 0, cfg.bg_opacity);
         g_cairo.rectangle(cr, tx - pad, baseline - font_size,
                           ext.width + 2 * pad, line_h);
         g_cairo.fill(cr);
 
-        /* Subtitle text */
         g_cairo.set_source_rgba(cr, cfg.text_r, cfg.text_g, cfg.text_b, 1);
         g_cairo.move_to(cr, tx, baseline);
         g_cairo.show_text(cr, lines[i]);
@@ -628,14 +578,12 @@ static void adjustment_cb(gint id,
     (void)overlay_x;
     (void)overlay_y;
     (void)user_data;
-    /* Subtitle bar: full stream width, a configurable fraction of the frame */
     struct config cfg;
     cfg_snapshot(&cfg);
     *overlay_width = stream->width;
     *overlay_height = (gint)(stream->height * cfg.bar_height_frac);
 }
 
-/* Clear stale subtitles */
 static gboolean expire_cb(gpointer user_data) {
     (void)user_data;
     struct config cfg;
@@ -693,11 +641,8 @@ static struct pw_stream *g_pw_stream = NULL;
 static struct spa_hook g_pw_stream_listener;
 static uint32_t g_pw_node_id = SPA_ID_INVALID;
 
-/* Capture source selection. PipeWire on Axis devices exposes a silent fallback
- * 'dummy-source' node alongside the real microphone(s); binding the first
- * Audio/Source that appears often grabs the dummy. So we log every source, skip
- * the dummy, optionally pick one the user selected by name (AudioInput), and
- * only fall back to the dummy if nothing better appears. */
+/* Axis PipeWire exposes a silent 'dummy-source' next to the real mic(s), so
+ * sources are ranked (source_rank()) and the dummy is only a last resort. */
 static char g_audio_input[128] = "";  /* user selection substring; "" = auto */
 static bool g_capture_bound = false;
 static uint32_t g_fallback_id = SPA_ID_INVALID;
@@ -705,13 +650,8 @@ static char g_fallback_name[256] = "";
 static int g_fallback_rank = 0;
 static guint g_fallback_timer_id = 0;
 
-/* PipeWire is only used for LOCAL microphone capture. On devices without a
- * local audio pipeline (e.g. video-less units used purely with remote audio)
- * libpipewire is absent, so like axoverlay/cairo it is loaded at runtime and
- * only when local capture is actually requested. The header still provides the
- * types, constants and inline/vtable helpers (PW_KEY_*, spa_* builders,
- * pw_core_get_registry, pw_registry_add_listener); only the real exported
- * functions are bound here. */
+/* libpipewire is absent on devices without local audio, so it is dlopen'd only
+ * for local capture. Header inline/vtable helpers need no binding. */
 struct pw_api {
     void *handle;
     typeof(pw_init) *init;
@@ -857,10 +797,8 @@ static bool source_matches(const char *name, const char *desc,
     return m;
 }
 
-/* Desirability of an audio source: 3 = the plain, fully processed microphone
- * (with the device's gain/AGC, best for speech), 2 = a raw variant such as
- * '.Unprocessed' or '.Uncompressed' (a dotted suffix on the input, often too
- * quiet), 1 = the silent 'dummy-source' fallback. Higher is better. */
+/* 3 = processed mic (device gain/AGC, best for speech), 2 = raw dotted variant
+ * such as '.Unprocessed' (often too quiet), 1 = silent 'dummy-source'. */
 static int source_rank(const char *name) {
     gchar *l = g_ascii_strdown(name, -1);
     int rank;
@@ -874,8 +812,7 @@ static int source_rank(const char *name) {
     return rank;
 }
 
-/* Create and connect the capture stream to the given node. Must be called with
- * the PipeWire thread loop locked. */
+/* Caller must hold the PipeWire thread loop lock. */
 static bool bind_capture_source(uint32_t id, const char *name) {
     struct pw_properties *stream_props =
         g_pw.properties_new(PW_KEY_MEDIA_TYPE, "Audio",
@@ -916,9 +853,8 @@ static bool bind_capture_source(uint32_t id, const char *name) {
     return true;
 }
 
-/* Called from the PipeWire loop thread for every global object; attach a
- * capture stream to a suitable audio source node. Every audio source is
- * logged so users can see what to select via the AudioInput setting. */
+/* PipeWire loop thread. Every audio source is logged so users can find names
+ * for the AudioInput setting. */
 static void on_registry_global(void *data,
                                uint32_t id,
                                uint32_t permissions,
@@ -945,8 +881,7 @@ static void on_registry_global(void *data,
     syslog(LOG_INFO, "audio source available: id %u name '%s' desc '%s'%s", id,
            name, desc != NULL ? desc : "", tag);
 
-    /* In manual mode (AudioInput set) only the user-selected input is eligible;
-     * in auto mode every source is. Either way the choice is ranked, so the
+    /* With AudioInput set only matching sources are eligible; either way the
      * plain processed mic wins over raw variants and the dummy. */
     if (g_audio_input[0] != '\0' && !source_matches(name, desc, g_audio_input))
         return;
@@ -962,8 +897,7 @@ static void on_registry_global(void *data,
     }
 }
 
-/* After enumeration settles, bind a fallback source if a real one was not
- * found, so devices that only expose a dummy node still behave as before. */
+/* After enumeration settles, bind the best fallback if no plain mic appeared. */
 static gboolean bind_fallback_cb(gpointer user) {
     (void)user;
     g_fallback_timer_id = 0;
@@ -1042,8 +976,7 @@ static bool start_audio(void) {
         return false;
     }
 
-    /* Give the registry a moment to enumerate, then bind a fallback source if
-     * no real microphone was found. */
+    /* Let the registry enumerate before settling for a fallback source. */
     g_fallback_timer_id = g_timeout_add(2000, bind_fallback_cb, NULL);
     return true;
 }
@@ -1276,14 +1209,12 @@ static int read_frame(uint64_t *next, int16_t *frame) {
     return dropped;
 }
 
-/* True when the whole line is a single non-speech annotation that whisper
- * emits on silence or music, e.g. "[BLANK_AUDIO]", "(bell dings)", or a line
- * of musical notes. A line that merely contains a parenthetical or starts
- * with an accented (non-ASCII) word is real speech and is kept. */
+/* Non-speech tags whisper emits on silence or music: a whole line in [], () or
+ * **, or any line starting with a musical note. Mere parentheticals are kept. */
 static bool is_nonspeech_annotation(const char *text) {
     if (text == NULL || text[0] == '\0')
         return true;
-    /* Musical note glyphs U+2669..U+266C (UTF-8 E2 99 A9..AC) => music. */
+    /* Musical notes (U+2669..U+266C) share the UTF-8 prefix E2 99. */
     if ((unsigned char)text[0] == 0xE2 && (unsigned char)text[1] == 0x99)
         return true;
     size_t len = strlen(text);
@@ -1299,12 +1230,8 @@ static bool is_nonspeech_annotation(const char *text) {
     return false;
 }
 
-/* Detect whisper's degenerate repetition loops (e.g. "Long day. Long day.
- * Long day. ..." x50), a common failure mode on quiet or non-speech audio.
- * Returns true when the phrase has many words but very few distinct ones,
- * so it can be filtered out instead of posted as a subtitle. Thresholds are
- * deliberately conservative so legitimately repetitive real speech (phone
- * numbers, "no no no", counting) is not misfiltered. */
+/* Whisper's repetition loops ("Long day. Long day. ...") on quiet audio.
+ * Conservative so real repetitive speech (numbers, counting) survives. */
 static bool looks_repetitive(const char *text) {
     gchar **words = g_strsplit(text, " ", -1);
     int total = 0;
@@ -1335,12 +1262,8 @@ static bool looks_repetitive(const char *text) {
     return distinct * 5 <= total;
 }
 
-/* Run whisper on utt[0..n_samples) with per-utterance normalization, a
- * dynamic encoder context (cost scales with the actual audio length, which
- * keeps streaming partials cheap), and hallucination filtering. Writes the
- * transcribed text to `out` (also on the filtered path, for logging) and
- * returns true only when the text is displayable. `out_ms` (optional) gets
- * the inference time. */
+/* Writes the text to out even when filtered (for logging); returns true only
+ * when it is displayable. out_ms (optional) gets the inference time. */
 static bool transcribe_buffer(struct whisper_context *ctx,
                               const int16_t *utt,
                               int n_samples,
@@ -1356,16 +1279,12 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     struct config cfg;
     cfg_snapshot(&cfg);
 
-    /* whisper needs at least ~1 s of audio; pad with silence */
     int n = n_samples;
     for (int i = 0; i < n; i++)
         pcmf[i] = (float)utt[i] / 32768.0f;
 
-    /* Per-utterance peak normalization. Genuinely quiet speech is boosted so
-     * whisper sees a strong, consistent level. Near-silence is NOT boosted:
-     * in a quiet room the mic noise floor would otherwise be amplified to
-     * full scale and whisper hallucinates movie-caption text on it. Anything
-     * that never rises above SIGNAL_PEAK_MIN is treated as noise and skipped. */
+    /* Boost quiet speech but never near-silence: amplified mic noise makes
+     * whisper hallucinate caption text. Below the noise guard, skip it. */
     float peak = 1e-6f;
     for (int i = 0; i < n_samples; i++) {
         float a = fabsf(pcmf[i]);
@@ -1376,7 +1295,7 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     if (skip_thresh < cfg.peak_min)
         skip_thresh = cfg.peak_min;
     if (peak < skip_thresh)
-        return false; /* below the adaptive noise guard: do not transcribe */
+        return false;
     float norm = 0.85f / peak;
     if (norm > cfg.max_gain)
         norm = cfg.max_gain;
@@ -1384,6 +1303,7 @@ static bool transcribe_buffer(struct whisper_context *ctx,
         for (int i = 0; i < n_samples; i++)
             pcmf[i] *= norm;
 
+    /* whisper needs at least 1 s of audio; pad with silence */
     while (n < SAMPLE_RATE + SAMPLE_RATE / 5)
         pcmf[n++] = 0.0f;
 
@@ -1400,23 +1320,14 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     wp.print_timestamps = false;
     wp.print_special = false;
     wp.suppress_blank = true;
-    /* Single greedy decode by default, no temperature fallback. Fallback
-     * re-decodes a degenerate segment up to ~6 times at rising temperatures;
-     * on the unintelligible background speech common to CCTV installs that
-     * costs many seconds (observed 8-68 s) per utterance, which makes the
-     * transcriber fall behind and drop audio. Repetition loops are caught
-     * cheaply afterwards by looks_repetitive() instead. Users can opt into
-     * fallback (better accuracy on hard speech) via the settings. */
+    /* Fallback off by default: its up-to-6 re-decodes cost 8-68 s per utterance
+     * on unintelligible CCTV speech, so the transcriber falls behind. */
     wp.temperature_inc = cfg.temp_fallback ? 0.2f : 0.0f;
-    /* Cap decoded tokens per segment. On unintelligible audio whisper never
-     * emits an end-of-text token and greedily decodes to its internal
-     * maximum (~224 tokens), which makes a single pass take many seconds and
-     * causes the transcriber to fall behind and drop audio. */
+    /* Unintelligible audio may never emit end-of-text and decode to whisper's
+     * ~224-token maximum, taking seconds per pass. */
     wp.max_tokens = cfg.max_tokens;
-    /* Encoder context sized to the audio (~50 mel-ctx units per second) plus
-     * margin, capped at the full 1500. Short partial buffers encode far
-     * faster than the fixed 30 s window, which is what makes ~1 s streaming
-     * updates practical. */
+    /* Encoder context sized to the audio (1500 = 30 s, so ~50/s) plus margin;
+     * short buffers encode far faster, which makes live partials practical. */
     int actx = (int)((double)n_samples / SAMPLE_RATE * 50.0) + 32;
     if (actx > 1500)
         actx = 1500;
@@ -1443,10 +1354,6 @@ static bool transcribe_buffer(struct whisper_context *ctx,
     g_strstrip(text);
     g_strlcpy(out, text, out_sz);
 
-    /* Drop typical non-speech hallucinations: whole-line annotations like
-     * "[BLANK_AUDIO]" or "(bell dings)", musical notes, and repetition
-     * loops. Lines that merely start with an accented word or contain a
-     * parenthetical are kept. */
     if (text[0] == '\0' || is_nonspeech_annotation(text) ||
         looks_repetitive(text))
         return false;
@@ -1478,16 +1385,14 @@ static void transcribe_utterance(struct whisper_context *ctx,
 
 static void *transcribe_thread(void *arg) {
     (void)arg;
-    /* Yield to the encoder/analytics under contention, but only slightly:
-     * a real microphone triggers inference intermittently, so a heavy nice
-     * handicap just slows each transcription for no benefit. (Was +5, chosen
-     * when constant mic noise triggered whisper nonstop.) */
+    /* Slight nice only: inference is intermittent with a real mic, so a
+     * heavier handicap (was +5) just slows each transcription. */
     setpriority(PRIO_PROCESS, 0, 1);
 
     whisper_log_set(whisper_log_cb, NULL);
 
-    /* Use whichever ggml-*.bin model is bundled (set via the Dockerfile
-     * MODEL arg), so the model can be swapped without changing code. */
+    /* Prefer the downloaded user model, else whichever ggml-*.bin the
+     * Dockerfile MODEL arg bundled. */
     gchar *model_path = NULL;
     GError *derr = NULL;
     if (g_model_path_override != NULL)
@@ -1608,13 +1513,8 @@ static void *transcribe_thread(void *arg) {
         if (silence_run < cfg.hang_frames &&
             utt_len < max_utter_samples &&
             utt_len + FRAME_SAMPLES <= max_samples) {
-            /* Utterance still in progress. In streaming mode, re-transcribe
-             * the audio so far every STREAM_STEP_SAMPLES and update the
-             * on-screen caption so it builds up live as the person speaks -
-             * but only while the transcriber is keeping up. If it has fallen
-             * behind (busy/continuous audio), skip the partial and let the
-             * reader drain the backlog; the final pass still captions the
-             * utterance. */
+            /* Streaming partial, only while keeping up; if behind, the final
+             * pass alone captions the utterance. */
             bool keeping_up = true;
             if (cfg.streaming) {
                 pthread_mutex_lock(&g_ring_lock);
@@ -1819,7 +1719,7 @@ static bool setup_overlay(void) {
     data.postype = AXOVERLAY_CUSTOM_NORMALIZED;
     data.anchor_point = AXOVERLAY_ANCHOR_CENTER;
     data.x = 0.0;
-    data.y = g_subtitle_top ? 0.15 : 0.75; /* top or bottom of the frame */
+    data.y = g_subtitle_top ? 0.15 : 0.75;
     data.scale_to_stream = FALSE;
     data.colorspace = AXOVERLAY_COLORSPACE_ARGB32;
 
@@ -1855,8 +1755,7 @@ static bool setup_overlay(void) {
 /* User-supplied model                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Read an application parameter; returns a newly allocated string (possibly
- * NULL). Caller frees. */
+/* Returns NULL if unavailable. Caller frees. */
 static gchar *param_get(AXParameter *params, const char *name) {
     if (params == NULL)
         return NULL;
@@ -1866,10 +1765,9 @@ static gchar *param_get(AXParameter *params, const char *name) {
     return value;
 }
 
-/* Download the GGML model at url into the app's writable localdata directory
- * (cached by URL so it is fetched only once) and return its path, or any
- * previously downloaded model on failure. Returns NULL when url is empty or
- * nothing is available. Caller frees. */
+/* Download url into localdata (cached by URL, fetched once). Falls back to a
+ * previous download on failure; NULL if url is empty or none exists. Caller
+ * frees. */
 static gchar *download_user_model(const char *url) {
     if (url == NULL || url[0] == '\0')
         return NULL;
@@ -1934,10 +1832,8 @@ static gchar *download_user_model(const char *url) {
     return g_strdup(model_path);
 }
 
-/* Full set of app settings with their defaults, mirroring the manifest
- * paramConfig. This is the source of truth for the app's own Settings web page
- * and is used to seed the settings file on devices without the VAPIX parameter
- * system (e.g. recorders such as the S3008). */
+/* Mirrors the manifest paramConfig; seeds the settings file on devices without
+ * the VAPIX parameter system (e.g. S3008 recorders). */
 struct setting_def {
     const char *name;
     const char *def;
@@ -1967,9 +1863,8 @@ static const struct setting_def SETTINGS[] = {
 
 static const char *g_setting_names[G_N_ELEMENTS(SETTINGS)];
 
-/* Password settings: never written to the settings file or returned to the
- * browser. They are read from the device parameter system at runtime, or set
- * (write-only) from the Settings page. */
+/* Never returned to the browser or seeded into the settings file; stored there
+ * only when set (write-only) from the Settings page. */
 static const char *const SECRET_SETTINGS[] = {
     "MqttPass",
     "RemoteAudioPass",
@@ -1982,10 +1877,8 @@ static gboolean is_secret_setting(const char *name) {
     return FALSE;
 }
 
-/* Resolve a setting: a non-empty settings-file value wins (the source of
- * truth, available on every device), otherwise the VAPIX parameter system
- * (axparameter). An empty file value falls through so unset/secret values are
- * taken from the device parameter system where present. Caller frees. */
+/* A non-empty settings-file value wins; else fall back to axparameter, where
+ * unset or secret values may still live. Caller frees. */
 static gchar *setting_read(AXParameter *params, const char *name) {
     gchar *v = settings_get(name);
     if (v != NULL && v[0] != '\0')
@@ -1994,9 +1887,7 @@ static gchar *setting_read(AXParameter *params, const char *name) {
     return param_get(params, name);
 }
 
-/* Apply a setting written through the config endpoint. Live-tunable settings
- * take effect immediately; startup-only ones are ignored here (they are read
- * at startup) and take effect on the next app restart. */
+/* Startup-only settings are ignored by cfg_apply() until the next restart. */
 static void apply_setting_cb(const char *name, const char *value, void *user) {
     (void)user;
     cfg_apply(name, value);
@@ -2013,21 +1904,13 @@ int main(void) {
     transcript_init();
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    /* Settings are stored in a file in the app's writable localdata directory
-     * so the Settings web page works on devices that do not serve the VAPIX
-     * parameter system / param.cgi (e.g. recorders such as the S3008). The
-     * device parameter system is still used for live change callbacks and as a
-     * fallback where present, but this file is the source of truth. */
+    /* File-backed so the Settings page works without param.cgi (e.g. S3008);
+     * axparameter is a fallback and the source of live change callbacks. */
     settings_init(PKG_DIR "/localdata/settings.conf");
     for (guint i = 0; i < G_N_ELEMENTS(SETTINGS); i++)
         g_setting_names[i] = SETTINGS[i].name;
 
-    /* Read settings before creating the overlay, and keep the AXParameter
-     * handle alive so later VAPIX changes are delivered live to
-     * param_changed_cb for the lifetime of the app.
-     *
-     * RemoteAudioHost set -> pull audio from another Axis device;
-     * empty -> capture from this camera via PipeWire. */
+    /* params stays alive so VAPIX changes reach param_changed_cb. */
     static const char *const tuning_params[] = {
         "MicSensitivity",      "SilenceTimeoutMs",    "MinSpeechMs",
         "MaxUtteranceSec",     "SubtitleDurationSec", "FontScale",
@@ -2048,8 +1931,6 @@ int main(void) {
     GError *perr = NULL;
     AXParameter *params = ax_parameter_new(APP_NAME, &perr);
     if (params != NULL) {
-        /* Register live-change callbacks for the tunable parameters where the
-         * parameter system is available. */
         for (guint i = 0; i < G_N_ELEMENTS(tuning_params); i++)
             load_and_watch(params, tuning_params[i]);
     } else {
@@ -2058,10 +1939,8 @@ int main(void) {
         g_clear_error(&perr);
     }
 
-    /* Seed the settings file for any setting it does not yet contain, taking
-     * an existing VAPIX value (pre-upgrade) if present, else the default, so
-     * the Settings page always returns meaningful values. Passwords are never
-     * written to the file; they stay in the device parameter system. */
+    /* Seed missing settings from VAPIX (pre-upgrade values) or defaults.
+     * Passwords are never seeded. */
     gboolean seeded = FALSE;
     for (guint i = 0; i < G_N_ELEMENTS(SETTINGS); i++) {
         if (is_secret_setting(SETTINGS[i].name))
@@ -2150,9 +2029,7 @@ int main(void) {
         syslog(LOG_WARNING,
                "starting without video subtitles; transcription outputs remain available");
 
-    /* Audio source: RemoteAudioHost set -> pull from another Axis device
-     * (VAPIX receive.cgi); empty -> capture from this camera's own mic
-     * (PipeWire). */
+    /* RemoteAudioHost set -> VAPIX receive.cgi; empty -> local mic (PipeWire). */
     bool audio_ok;
     if (remote_host != NULL && remote_host[0] != '\0')
         audio_ok = start_remote_audio(remote_host,
@@ -2179,17 +2056,13 @@ int main(void) {
     g_model_path_override = download_user_model(model_url);
     g_free(model_url);
 
-    /* Expose transcriptions to other systems, and serve the settings config
-     * endpoint (admin route) so the Settings page works without param.cgi.
-     * This runs even with no audio source so settings stay editable on
-     * devices that need to be pointed at a remote audio source first. */
+    /* Started even without audio so settings stay editable on devices that
+     * must first be pointed at a remote audio source. */
     webapi_start(API_PORT, api_enabled, CONFIG_PORT, g_setting_names,
                  G_N_ELEMENTS(SETTINGS), SECRET_SETTINGS,
                  G_N_ELEMENTS(SECRET_SETTINGS), apply_setting_cb, NULL);
     mqtt_start(&mcfg);
 
-    /* Transcription only runs when there is an audio source; otherwise the app
-     * idles (serving Settings/API) until reconfigured and restarted. */
     pthread_t transcribe_tid;
     bool transcribe_started = false;
     if (audio_ok) {
